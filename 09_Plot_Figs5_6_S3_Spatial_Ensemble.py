@@ -76,7 +76,7 @@ def plot_figure_5(ts_df: pd.DataFrame, fig_dir: str):
     )
 
     out_file = os.path.join(fig_dir, "Figure5_Temporal_TTI_Spatial_Ensemble.png")
-    plt.tight_layout(rect=[0, 0.08, 1, 0.93])
+    fig.subplots_adjust(left=0.10, right=0.96, bottom=0.18, top=0.86)
     fig.savefig(out_file, dpi=500, facecolor="white")
     plt.close(fig)
     print(f"Figure 5 successfully saved to: {out_file}")
@@ -86,7 +86,7 @@ def plot_figure_6(map_df: pd.DataFrame, fig_dir: str):
     target_years = [1970, 1995, 2020]
     cmap = get_tti_colormap()
 
-    fig, axes = plt.subplots(3, 2, figsize=(7.5, 9.5), sharex=True, sharey=True)
+    fig, axes = plt.subplots(3, 2, figsize=(7.5, 9.6))
     col_titles = ["Ecosystem Model\n(True TTI)", "MLP_SPAT Ensemble\n(Predicted Mean TTI)"]
 
     for r_i, yr in enumerate(target_years):
@@ -95,7 +95,7 @@ def plot_figure_6(map_df: pd.DataFrame, fig_dir: str):
             ax = axes[r_i, c_i]
             ax.set_facecolor("white")
             lons, lats, z_grid = df_to_regular_2d_grid(sub_yr, val_col)
-            z_clipped = np.clip(z_grid, 0.4, 1.0)
+            z_clipped = np.ma.masked_invalid(np.clip(z_grid, 0.4, 1.0))
 
             im = ax.pcolormesh(
                 lons, lats, z_clipped, cmap=cmap, vmin=0.4, vmax=1.0, shading="auto"
@@ -109,34 +109,49 @@ def plot_figure_6(map_df: pd.DataFrame, fig_dir: str):
 
             ax.set_xlim(9.0, 30.5)
             ax.set_ylim(53.5, 66.5)
-            ax.set_aspect(1.7)
+            ax.set_aspect(1.7, adjustable="box")
+
             ax.set_xticks([10, 20, 30])
-            ax.set_xticklabels(["10°E", "20°E", "30°E"], fontsize=10.5)
+            if r_i == 2:
+                ax.set_xticklabels(["10°E", "20°E", "30°E"], fontsize=10.5)
+            else:
+                ax.set_xticklabels([])
+
             ax.set_yticks([54, 58, 62, 66])
-            ax.set_yticklabels(["54°N", "58°N", "62°N", "66°N"], fontsize=10.5)
+            if c_i == 0:
+                ax.set_yticklabels(["54°N", "58°N", "62°N", "66°N"], fontsize=10.5)
+            else:
+                ax.set_yticklabels([])
+
+            for spine in ax.spines.values():
+                spine.set_linewidth(0.9)
 
             if r_i == 0:
-                ax.set_title(col_titles[c_i], fontsize=12, fontweight="bold", pad=8)
+                ax.set_title(
+                    col_titles[c_i], fontsize=11.5, fontweight="bold", pad=10,
+                    bbox=dict(boxstyle="square,pad=0.35", facecolor="#f2f2f2", edgecolor="black", linewidth=0.8)
+                )
             if c_i == 1:
-                ax_r = ax.twinx()
-                ax_r.set_yticks([])
-                ax_r.set_ylabel(
-                    f"Pentad Center: {yr}", fontsize=11.5, fontweight="bold", rotation=270, labelpad=15
+                ax.text(
+                    1.06, 0.5, f"Pentad Center: {yr}",
+                    transform=ax.transAxes, rotation=270, va="center", ha="center",
+                    fontsize=11, fontweight="bold",
+                    bbox=dict(boxstyle="square,pad=0.35", facecolor="#f2f2f2", edgecolor="black", linewidth=0.8)
                 )
 
-    fig.supxlabel("Longitude", fontsize=12.5, fontweight="bold", y=0.08)
+    fig.supxlabel("Longitude", fontsize=12.5, fontweight="bold", y=0.075)
     fig.supylabel("Latitude", fontsize=12.5, fontweight="bold", x=0.03)
     fig.suptitle(
         "Spatio-Temporal Reconstruction of Baltic Sea Trophic Status",
         fontsize=14.5, fontweight="bold", y=0.97
     )
 
-    cbar_ax = fig.add_axes([0.22, 0.025, 0.56, 0.018])
+    fig.subplots_adjust(left=0.11, right=0.89, bottom=0.12, top=0.89, wspace=0.06, hspace=0.08)
+    cbar_ax = fig.add_axes([0.22, 0.03, 0.56, 0.018])
     cbar = fig.colorbar(im, cax=cbar_ax, orientation="horizontal")
     cbar.set_label("TTI Value:", fontsize=11.5, fontweight="bold", labelpad=4)
 
     out_file = os.path.join(fig_dir, "Figure6_Spatio_Temporal_TTI_Ensemble_Grid.png")
-    plt.tight_layout(rect=[0.04, 0.09, 0.96, 0.94])
     fig.savefig(out_file, dpi=500, facecolor="white")
     plt.close(fig)
     print(f"Figure 6 successfully saved to: {out_file}")
@@ -148,16 +163,18 @@ def plot_figure_s3(map_df: pd.DataFrame, fig_dir: str):
     cmap_sd = plt.get_cmap("plasma").copy()
     cmap_sd.set_bad(color="white")
 
-    fig, axes = plt.subplots(3, 2, figsize=(8.5, 9.5), sharex=True, sharey=True)
+    fig, axes = plt.subplots(3, 2, figsize=(8.5, 9.6))
 
     for r_i, yr in enumerate(target_years):
         sub_yr = map_df[map_df["Year"] == yr]
 
         # Left column: Predicted Mean TTI
         ax_m = axes[r_i, 0]
+        ax_m.set_facecolor("white")
         lons, lats, z_mean = df_to_regular_2d_grid(sub_yr, "Ensemble_Mean_TTI")
+        z_mean_masked = np.ma.masked_invalid(np.clip(z_mean, 0.4, 1.0))
         im_m = ax_m.pcolormesh(
-            lons, lats, np.clip(z_mean, 0.4, 1.0), cmap=cmap_mean, vmin=0.4, vmax=1.0, shading="auto"
+            lons, lats, z_mean_masked, cmap=cmap_mean, vmin=0.4, vmax=1.0, shading="auto"
         )
         try:
             ax_m.contour(lons, lats, z_mean, levels=[0.71], colors="black", linewidths=0.75, alpha=0.85)
@@ -165,52 +182,68 @@ def plot_figure_s3(map_df: pd.DataFrame, fig_dir: str):
             pass
         ax_m.set_xlim(9.0, 30.5)
         ax_m.set_ylim(53.5, 66.5)
-        ax_m.set_aspect(1.7)
+        ax_m.set_aspect(1.7, adjustable="box")
         ax_m.set_xticks([10, 20, 30])
-        ax_m.set_xticklabels(["10°E", "20°E", "30°E"], fontsize=10.5)
+        if r_i == 2:
+            ax_m.set_xticklabels(["10°E", "20°E", "30°E"], fontsize=10.5)
+        else:
+            ax_m.set_xticklabels([])
         ax_m.set_yticks([54, 58, 62, 66])
         ax_m.set_yticklabels(["54°N", "58°N", "62°N", "66°N"], fontsize=10.5)
+        for spine in ax_m.spines.values():
+            spine.set_linewidth(0.9)
         if r_i == 0:
-            ax_m.set_title("A: Predicted Mean TTI", fontsize=12.5, fontweight="bold", pad=8)
+            ax_m.set_title("A: Predicted Mean TTI", fontsize=12.5, fontweight="bold", pad=10)
 
         # Right column: Ensemble Uncertainty (SD capped at 0.10)
         ax_s = axes[r_i, 1]
+        ax_s.set_facecolor("white")
         lons, lats, z_sd = df_to_regular_2d_grid(sub_yr, "Ensemble_SD_TTI")
+        z_sd_masked = np.ma.masked_invalid(np.clip(z_sd, 0.0, 0.10))
         im_s = ax_s.pcolormesh(
-            lons, lats, np.clip(z_sd, 0.0, 0.10), cmap=cmap_sd, vmin=0.0, vmax=0.10, shading="auto"
+            lons, lats, z_sd_masked, cmap=cmap_sd, vmin=0.0, vmax=0.10, shading="auto"
         )
         ax_s.set_xlim(9.0, 30.5)
         ax_s.set_ylim(53.5, 66.5)
-        ax_s.set_aspect(1.7)
+        ax_s.set_aspect(1.7, adjustable="box")
         ax_s.set_xticks([10, 20, 30])
-        ax_s.set_xticklabels(["10°E", "20°E", "30°E"], fontsize=10.5)
+        if r_i == 2:
+            ax_s.set_xticklabels(["10°E", "20°E", "30°E"], fontsize=10.5)
+        else:
+            ax_s.set_xticklabels([])
+        ax_s.set_yticks([54, 58, 62, 66])
+        ax_s.set_yticklabels([])
+        for spine in ax_s.spines.values():
+            spine.set_linewidth(0.9)
         if r_i == 0:
-            ax_s.set_title("B: Spatial Bootstrap Uncertainty", fontsize=12.5, fontweight="bold", pad=8)
+            ax_s.set_title("B: Spatial Bootstrap Uncertainty", fontsize=12.5, fontweight="bold", pad=10)
 
-        ax_r = ax_s.twinx()
-        ax_r.set_yticks([])
-        ax_r.set_ylabel(
-            f"Pentad Center: {yr}", fontsize=11.5, fontweight="bold", rotation=270, labelpad=15
+        ax_s.text(
+            1.06, 0.5, f"Pentad Center: {yr}",
+            transform=ax_s.transAxes, rotation=270, va="center", ha="center",
+            fontsize=11, fontweight="bold",
+            bbox=dict(boxstyle="square,pad=0.35", facecolor="#f2f2f2", edgecolor="black", linewidth=0.8)
         )
 
-    fig.supxlabel("Longitude", fontsize=12.5, fontweight="bold", y=0.08)
+    fig.supxlabel("Longitude", fontsize=12.5, fontweight="bold", y=0.075)
     fig.supylabel("Latitude", fontsize=12.5, fontweight="bold", x=0.03)
     fig.suptitle(
         "MLP_SPAT Spatial Bootstrap Ensemble (Means and Standard Deviations)",
         fontsize=14.5, fontweight="bold", y=0.97
     )
 
-    cbar_m_ax = fig.add_axes([0.12, 0.025, 0.34, 0.018])
+    fig.subplots_adjust(left=0.10, right=0.89, bottom=0.12, top=0.90, wspace=0.06, hspace=0.08)
+
+    cbar_m_ax = fig.add_axes([0.12, 0.03, 0.34, 0.018])
     cbar_m = fig.colorbar(im_m, cax=cbar_m_ax, orientation="horizontal")
     cbar_m.set_label("Mean TTI:", fontsize=11, fontweight="bold")
 
-    cbar_s_ax = fig.add_axes([0.56, 0.025, 0.34, 0.018])
+    cbar_s_ax = fig.add_axes([0.54, 0.03, 0.34, 0.018])
     cbar_s = fig.colorbar(im_s, cax=cbar_s_ax, orientation="horizontal", ticks=[0.0, 0.05, 0.10])
     cbar_s.ax.set_xticklabels(["0.00", "0.05", ">0.10"])
     cbar_s.set_label("TTI SD (Uncertainty):", fontsize=11, fontweight="bold")
 
     out_file = os.path.join(fig_dir, "Figure_S3_Ensemble_Uncertainty_Maps.png")
-    plt.tight_layout(rect=[0.04, 0.09, 0.96, 0.94])
     fig.savefig(out_file, dpi=500, facecolor="white")
     plt.close(fig)
     print(f"Supplementary Figure S3 successfully saved to: {out_file}")
