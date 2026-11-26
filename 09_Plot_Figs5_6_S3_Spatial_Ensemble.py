@@ -77,7 +77,7 @@ def plot_figure_5(ts_df: pd.DataFrame, fig_dir: str):
 
     out_file = os.path.join(fig_dir, "Figure5_Temporal_TTI_Spatial_Ensemble.png")
     fig.subplots_adjust(left=0.10, right=0.96, bottom=0.18, top=0.86)
-    fig.savefig(out_file, dpi=500, facecolor="white")
+    fig.savefig(out_file, dpi=500, facecolor="white", bbox_inches="tight", pad_inches=0.22)
     plt.close(fig)
     print(f"Figure 5 successfully saved to: {out_file}")
 
@@ -139,7 +139,7 @@ def plot_figure_6(map_df: pd.DataFrame, fig_dir: str):
                     bbox=dict(boxstyle="square,pad=0.35", facecolor="#f2f2f2", edgecolor="black", linewidth=0.8)
                 )
 
-    fig.supxlabel("Longitude", fontsize=12.5, fontweight="bold", y=0.075)
+    fig.supxlabel("Longitude", fontsize=12.5, fontweight="bold", y=0.082)
     fig.supylabel("Latitude", fontsize=12.5, fontweight="bold", x=0.03)
     fig.suptitle(
         "Spatio-Temporal Reconstruction of Baltic Sea Trophic Status",
@@ -147,12 +147,12 @@ def plot_figure_6(map_df: pd.DataFrame, fig_dir: str):
     )
 
     fig.subplots_adjust(left=0.11, right=0.89, bottom=0.12, top=0.89, wspace=0.06, hspace=0.08)
-    cbar_ax = fig.add_axes([0.22, 0.03, 0.56, 0.018])
+    cbar_ax = fig.add_axes([0.22, 0.025, 0.56, 0.018])
     cbar = fig.colorbar(im, cax=cbar_ax, orientation="horizontal")
     cbar.set_label("TTI Value:", fontsize=11.5, fontweight="bold", labelpad=4)
 
     out_file = os.path.join(fig_dir, "Figure6_Spatio_Temporal_TTI_Ensemble_Grid.png")
-    fig.savefig(out_file, dpi=500, facecolor="white")
+    fig.savefig(out_file, dpi=500, facecolor="white", bbox_inches="tight", pad_inches=0.22)
     plt.close(fig)
     print(f"Figure 6 successfully saved to: {out_file}")
 
@@ -225,7 +225,7 @@ def plot_figure_s3(map_df: pd.DataFrame, fig_dir: str):
             bbox=dict(boxstyle="square,pad=0.35", facecolor="#f2f2f2", edgecolor="black", linewidth=0.8)
         )
 
-    fig.supxlabel("Longitude", fontsize=12.5, fontweight="bold", y=0.075)
+    fig.supxlabel("Longitude", fontsize=12.5, fontweight="bold", y=0.082)
     fig.supylabel("Latitude", fontsize=12.5, fontweight="bold", x=0.03)
     fig.suptitle(
         "MLP_SPAT Spatial Bootstrap Ensemble (Means and Standard Deviations)",
@@ -234,17 +234,17 @@ def plot_figure_s3(map_df: pd.DataFrame, fig_dir: str):
 
     fig.subplots_adjust(left=0.10, right=0.89, bottom=0.12, top=0.90, wspace=0.06, hspace=0.08)
 
-    cbar_m_ax = fig.add_axes([0.12, 0.03, 0.34, 0.018])
+    cbar_m_ax = fig.add_axes([0.12, 0.025, 0.34, 0.018])
     cbar_m = fig.colorbar(im_m, cax=cbar_m_ax, orientation="horizontal")
     cbar_m.set_label("Mean TTI:", fontsize=11, fontweight="bold")
 
-    cbar_s_ax = fig.add_axes([0.54, 0.03, 0.34, 0.018])
+    cbar_s_ax = fig.add_axes([0.54, 0.025, 0.34, 0.018])
     cbar_s = fig.colorbar(im_s, cax=cbar_s_ax, orientation="horizontal", ticks=[0.0, 0.05, 0.10])
     cbar_s.ax.set_xticklabels(["0.00", "0.05", ">0.10"])
     cbar_s.set_label("TTI SD (Uncertainty):", fontsize=11, fontweight="bold")
 
     out_file = os.path.join(fig_dir, "Figure_S3_Ensemble_Uncertainty_Maps.png")
-    fig.savefig(out_file, dpi=500, facecolor="white")
+    fig.savefig(out_file, dpi=500, facecolor="white", bbox_inches="tight", pad_inches=0.22)
     plt.close(fig)
     print(f"Supplementary Figure S3 successfully saved to: {out_file}")
 

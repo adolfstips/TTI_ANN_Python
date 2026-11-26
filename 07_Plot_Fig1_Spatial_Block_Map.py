@@ -144,7 +144,7 @@ def main():
 
     out_file = os.path.join(fig_dir, "Figure1_Spatial_Block_Geographic.png")
     fig.subplots_adjust(left=0.10, right=0.95, bottom=0.10, top=0.90)
-    fig.savefig(out_file, dpi=500, facecolor="white")
+    fig.savefig(out_file, dpi=500, facecolor="white", bbox_inches="tight", pad_inches=0.22)
     plt.close(fig)
     print(f"Figure 1 successfully saved to: {out_file}")
 

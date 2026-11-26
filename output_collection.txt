@@ -1,0 +1,84 @@
+======================================================================
+TTI_ANN_Python MASTER WORKFLOW LOG
+Started at : 2026-11-26 12:15:19
+Python     : 3.12.16 (Linux-6.18.58.1-microsoft-standard-WSL2-x86_64-with-glibc2.39)
+GPU Device : NVIDIA GeForce RTX 5090 Laptop GPU (CUDA 13.2)
+Sleep Guard: Active (wsl2_powershell -> ES_SYSTEM_REQUIRED)
+======================================================================
+
+Skipping training scripts (01-05, 11); regenerating tables and figures...
+
+======================================================================
+EXECUTING: 06_Generate_Manuscript_Tables.py | Started at: 12:15:19
+======================================================================
+
+==================================================================
+TABLE 2: SPATIAL EXTRAPOLATION PERFORMANCE (SECTION 3.1)
+==================================================================
+Architecture       Scenario       Accuracy       F1_Score           RMSE             R2
+   LSTM_SPAT  Comprehensive 0.934 (±0.006) 0.901 (±0.013) 0.041 (±0.003) 0.906 (±0.011)
+   LSTM_SPAT  MSFD_Baseline 0.929 (±0.007) 0.895 (±0.012) 0.043 (±0.002) 0.895 (±0.008)
+   LSTM_SPAT Remote_Sensing 0.931 (±0.006) 0.897 (±0.012) 0.043 (±0.002) 0.897 (±0.009)
+    MLP_SPAT  Comprehensive 0.880 (±0.005) 0.859 (±0.012) 0.062 (±0.003) 0.777 (±0.020)
+    MLP_SPAT  MSFD_Baseline 0.863 (±0.003) 0.838 (±0.011) 0.073 (±0.006) 0.695 (±0.029)
+    MLP_SPAT Remote_Sensing 0.844 (±0.008) 0.806 (±0.019) 0.082 (±0.003) 0.613 (±0.030)
+
+==================================================================
+TABLE 3: OUT-OF-SAMPLE TEMPORAL EXTRAPOLATION PERFORMANCE (SECTION 3.2)
+==================================================================
+Architecture       Scenario       Accuracy       F1_Score           RMSE             R2
+   LSTM_TIME  Comprehensive 0.821 (±0.050) 0.613 (±0.225) 0.120 (±0.019) 0.107 (±0.192)
+   LSTM_TIME  MSFD_Baseline 0.826 (±0.039) 0.698 (±0.065) 0.117 (±0.019) 0.150 (±0.171)
+   LSTM_TIME Remote_Sensing 0.853 (±0.032) 0.723 (±0.056) 0.117 (±0.018) 0.084 (±0.450)
+    MLP_TIME  Comprehensive 0.879 (±0.042) 0.790 (±0.060) 0.096 (±0.022) 0.419 (±0.201)
+    MLP_TIME  MSFD_Baseline 0.860 (±0.026) 0.756 (±0.041) 0.107 (±0.018) 0.310 (±0.123)
+    MLP_TIME Remote_Sensing 0.883 (±0.037) 0.782 (±0.052) 0.105 (±0.019) 0.313 (±0.181)
+
+==================================================================
+TABLE 4: GLOBAL FEATURE IMPORTANCE - SHAP (SECTION 3.3)
+==================================================================
+Feature         MLP_SPAT        LSTM_SPAT         MLP_TIME        LSTM_TIME
+  Depth 0.0480 (±0.0036) 0.0216 (±0.0022) 0.0568 (±0.0044) 0.0432 (±0.0210)
+ Secchi 0.0309 (±0.0018) 0.0468 (±0.0073) 0.0374 (±0.0104) 0.0516 (±0.0242)
+   Chla 0.0249 (±0.0023) 0.0368 (±0.0026) 0.0219 (±0.0033) 0.0356 (±0.0244)
+    Pho 0.0189 (±0.0015) 0.0222 (±0.0017) 0.0219 (±0.0040) 0.0131 (±0.0063)
+    Nit 0.0178 (±0.0010) 0.0199 (±0.0021) 0.0127 (±0.0034) 0.0119 (±0.0022)
+ DO2_mg 0.0177 (±0.0022) 0.0139 (±0.0008) 0.0164 (±0.0078) 0.0209 (±0.0097)
+   Temp 0.0101 (±0.0005) 0.0210 (±0.0008) 0.0135 (±0.0040) 0.0242 (±0.0078)
+
+All manuscript tables (Tables 2, 3, and 4) successfully saved to: ./Tables
+COMPLETED: 06_Generate_Manuscript_Tables.py in 0.00 minutes.
+
+======================================================================
+EXECUTING: 07_Plot_Fig1_Spatial_Block_Map.py | Started at: 12:15:19
+======================================================================
+Figure 1 successfully saved to: ./Figures/Figure1_Spatial_Block_Geographic.png
+COMPLETED: 07_Plot_Fig1_Spatial_Block_Map.py in 0.05 minutes.
+
+======================================================================
+EXECUTING: 08_Plot_Figs2_3_4_SHAP_Analysis.py | Started at: 12:15:21
+======================================================================
+Figure 2 successfully saved to: ./Figures/Figure2_Temporal_SHAP_Stability.png
+Figure 3 successfully saved to: ./Figures/Figure3_Spatial_SHAP_Stability.png
+Figure 4 successfully saved to: ./Figures/Figure4_Spatial_SHAP_Beeswarm.png
+COMPLETED: 08_Plot_Figs2_3_4_SHAP_Analysis.py in 0.03 minutes.
+
+======================================================================
+EXECUTING: 09_Plot_Figs5_6_S3_Spatial_Ensemble.py | Started at: 12:15:22
+======================================================================
+Figure 5 successfully saved to: ./Figures/Figure5_Temporal_TTI_Spatial_Ensemble.png
+Figure 6 successfully saved to: ./Figures/Figure6_Spatio_Temporal_TTI_Ensemble_Grid.png
+Supplementary Figure S3 successfully saved to: ./Figures/Figure_S3_Ensemble_Uncertainty_Maps.png
+COMPLETED: 09_Plot_Figs5_6_S3_Spatial_Ensemble.py in 0.04 minutes.
+
+======================================================================
+EXECUTING: 10_Plot_FigsS1_S2_Confusion_Matrices.py | Started at: 12:15:25
+======================================================================
+Figure_S1 (MLP_SPAT) successfully saved to: ./Figures/Figure_S1_Confusion_Matrix_MLP_SPAT.png
+Figure_S2 (LSTM_SPAT) successfully saved to: ./Figures/Figure_S2_Confusion_Matrix_LSTM_SPAT.png
+COMPLETED: 10_Plot_FigsS1_S2_Confusion_Matrices.py in 0.02 minutes.
+
+======================================================================
+ALL PYTHON PIPELINE STEPS COMPLETED SUCCESSFULLY in 0.15 minutes.
+Finished at: 2026-11-26 12:15:26
+======================================================================

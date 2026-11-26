@@ -1,68 +1,30 @@
-# A Deep Learning Framework for Functional Eutrophication Assessment: Mapping the Trophic Transfer Index (Python Implementation)
+# TTI_ANN_Python — Deep Learning Emulation of the Baltic Sea Trophic Transfer Index
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Python Version](https://img.shields.io/badge/Python-3.11%2B-3776AB.svg)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.2%2B-EE4C2C.svg)](https://pytorch.org/)
+Companion Python/PyTorch implementation for **Stips et al. (2026)**, *"A Deep Learning Framework for Functional Eutrophication Assessment: Mapping the Trophic Transfer Index"* (*Environmental Modelling & Software*; primary R repository: https://github.com/adolfstips/TTI_ANN_FIG).
 
-**Authors:** Adolf Stips*, Ove Pärn, Luca Polimene, Diego Macias-Moy*, Svetla Miladinova, Elisa Garcia-Gorriz, Olaf Duteil  
-**Journal:** *Environmental Modelling & Software* (2026)  
-**Contact:** `adolf.stips@ext.ec.europa.eu` | `adolf.stips@gmail.com`  
-**Companion R Repository:** [https://github.com/adolfstips/TTI_ANN_FIG](https://github.com/adolfstips/TTI_ANN_FIG)
+## Methodological Highlights (Revision 2)
+- **Zero-Leakage Spatial & Temporal Validation:**
+  - `01_Kfold_MLP_SPAT.py` & `02_Kfold_LSTM_SPAT.py`: 10-fold spatial block cross-validation (`10×10` grid cells; 80% train / 10% validation / 10% held-out test).
+  - `03_Rolling_MLP_TIME.py` & `04_Rolling_LSTM_TIME.py`: Expanding 30-year rolling-origin out-of-sample temporal extrapolation (`1995–2020`, 6 unseen forward assessment pentads conditional on contemporaneous predictors, separated from training windows by a 5-year validation buffer).
+- **Controlled Common-Period & Recurrence Experiment (`11_Controlled_SPAT_Comparison_SM.py`):**
+  - Evaluates `MLP_SPAT_Common8` (`1-pentad` input), `MLP_SEQ7_Windowed` (`7-pentad` flattened feedforward control), and `LSTM_SPAT_Common8` (`7-pentad` sequential recurrent network) on the identical held-out spatial blocks and identical 8 target pentads (`1985–2020`), reporting paired fold-level differences and two-sided paired *t*-tests (**Supplementary Table S1**).
+- **Pure-GPU 2D & 3D Trajectory-Level Monte Carlo Shapley (`tti_common.py`):**
+  - Implements paired Monte Carlo Shapley estimation (Štrumbelj & Kononenko, 2014) directly on GPU tensors—swapping complete 7-pentad chronological trajectories (`Steps 1–7`) for `LSTM_SPAT` and `LSTM_TIME` alongside an exact 2-block temporal inertia decomposition (`Steps 1–6` antecedent history vs. `Step 7` target pentad).
 
----
+- **Automatic Pre-Flight Check, Sleep Guard & Transcript Logging (`00_Run_All_Workflow.py`):**
+  - Verifies package dependencies up front, prevents Windows/WSL2 host sleep strictly while running (`SetThreadExecutionState`), and saves the complete console log to `output_collection.txt`.
 
-## Overview
-
-This repository provides a complete, standalone **Python / PyTorch** translation of the R computational workflow for the manuscript **"A Deep Learning Framework for Functional Eutrophication Assessment: Mapping the Trophic Transfer Index"**.
-
-Every script (`00` through `10`), neural network architecture (`MLP` and `LSTM`), spatial/temporal partitioning scheme, zero-leakage standardization step, and Monte Carlo SHAP (`nsim = 50`) algorithm is a strict 1-to-1 mathematical counterpart to the reference R implementation.
-
----
-
-## Repository Structure
-
-```text
-TTI_ANN_Python/
-├── README.md                                  # Workflow documentation and instructions
-├── LICENSE                                    # GNU General Public License v3.0 (GPL-3.0)
-├── environment.yml                            # Conda environment specification (CUDA + PyTorch)
-├── requirements.txt                           # Pip package dependencies
-├── tti_common.py                              # Shared NetCDF loader, PyTorch models, training & GPU-SHAP engine
-├── GES_Baltic_5year_ALLE_Combined_4D.nc.zip   # Place zipped or unzipped NetCDF input dataset in root
-│
-├── 00_Run_All_Workflow.py                     # Master script to execute the full pipeline
-├── 01_Kfold_MLP_SPAT.py                       # 10-Fold Spatial Block CV (MLP_SPAT)
-├── 02_Kfold_LSTM_SPAT.py                      # 10-Fold Spatial Block CV (LSTM_SPAT)
-├── 03_Rolling_MLP_TIME.py                     # Rolling-Origin Temporal Forecast (MLP_TIME)
-├── 04_Rolling_LSTM_TIME.py                    # Rolling-Origin Temporal Forecast (LSTM_TIME)
-├── 05_Spatial_Ensemble_MLP_SPAT.py            # 10-Fold Spatial Bootstrap Ensemble Reconstruction
-├── 06_Generate_Manuscript_Tables.py           # Generates Manuscript Tables 2, 3, and 4 (.docx & .csv)
-├── 07_Plot_Fig1_Spatial_Block_Map.py          # Generates Figure 1
-├── 08_Plot_Figs2_3_4_SHAP_Analysis.py         # Generates Figures 2, 3, and 4
-├── 09_Plot_Figs5_6_S3_Spatial_Ensemble.py     # Generates Figures 5, 6, and Supplementary Fig S3
-├── 10_Plot_FigsS1_S2_Confusion_Matrices.py    # Generates Supplementary Figures S1 and S2
-│
-├── Output/                                    # Generated .pkl model summaries, SHAP & ensemble outputs
-├── Tables/                                    # Generated Manuscript Tables (.docx and .csv)
-└── Figures/                                   # Generated Publication Figures (.png, 500 DPI)
-```
-
----
-
-## Quick Start & Installation
-
-### 1. Create the Conda Environment
+## Quick Start
 ```bash
-conda env create -f environment.yml
-conda activate tti_ann
-```
-*(Alternatively, install into an existing environment via `pip install -r requirements.txt`).*
+# 1. Install dependencies (Python >= 3.10 with CUDA-enabled PyTorch)
+pip install -r requirements.txt
 
-### 2. Place Input Dataset
-Copy `GES_Baltic_5year_ALLE_Combined_4D.nc` (or `GES_Baltic_5year_ALLE_Combined_4D.nc.zip`) into the root folder of this repository. The workflow automatically unzips `.nc.zip` if the `.nc` file is not yet extracted.
-
-### 3. Execute the Complete Pipeline
-```bash
+# 2. Place GES_Baltic_5year_ALLE_Combined_4D.nc.zip (or .nc) in the root folder and run all steps:
 python 00_Run_All_Workflow.py
+
+# 3. Regenerate tables and figures only (skipping neural network training):
+python 00_Run_All_Workflow.py --skip-training
 ```
-* Set `RUN_TRAINING = True` inside `00_Run_All_Workflow.py` (or pass `--skip-training` on the command line) to toggle between full neural network training and fast table/figure regeneration from `./Output/*.pkl`.
+
+## License
+GNU General Public License v3.0 (GPL-3.0).

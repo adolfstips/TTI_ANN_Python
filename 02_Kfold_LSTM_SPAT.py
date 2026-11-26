@@ -1,6 +1,10 @@
 # ==============================================================================
 # Script: 02_Kfold_LSTM_SPAT.py
 # Title: 10-Fold Spatial Block Cross-Validation for Recurrent Network (LSTM_SPAT)
+# Description: Evaluates 7-pentad (35-yr) recurrent spatial gap-filling across
+#              10 non-overlapping 10x10 pixel blocks with pure-GPU 3D trajectory
+#              Monte Carlo Shapley attributions (Strumbelj & Kononenko, 2014)
+#              and 2-block temporal inertia diagnostics (Steps 1-6 vs Step 7).
 # Reference: Stips et al. (2026) - Environmental Modelling & Software
 # License: GPL-3.0
 # ==============================================================================
@@ -12,145 +16,159 @@ import pandas as pd
 import torch
 from tti_common import (
     VAR_COM,
-    set_seeds,
-    get_device,
+    init_torch_device,
+    set_all_seeds,
     load_baltic_data,
     assign_kfold_blocks,
-    create_sequences,
+    create_sequences_3d,
     LSTMNet,
-    train_neural_network,
+    train_model_vram,
     predict_batches,
-    evaluate_predictions,
-    compute_fastshap_mc,
-    aggregate_summary_tables,
-    build_confusion_matrix_df,
+    calc_eval_metrics,
+    build_confusion_dict,
+    compute_3d_shap_lstm,
+    compute_temporal_block_shap,
+    summarize_metrics_df,
+    summarize_shap_df,
     save_pickle,
 )
 
 
-def main():
-    set_seeds(123)
-    device = get_device()
-
+def main() -> None:
+    device = init_torch_device(num_threads=4, seed=123)
     model_name = "LSTM_SPAT"
     out_dir = "./Output"
     os.makedirs(out_dir, exist_ok=True)
-    rfile = "./GES_Baltic_5year_ALLE_Combined_4D.nc"
 
     ntime = 14
-    sequence_length = 7  # 7 pentads = 35-year chronological memory window
+    sequence_length = 7
     n_splits = 10
     block_size = 10
     target_var = "TTI"
     tt_threshold = 0.71
-
     batch_size = 2048
+    pred_batch_size = 65536
     num_epochs = 150
     patience = 20
     learning_rate = 0.002
+    nsim_shap = 50
 
-    baltic = load_baltic_data(rfile, block_size=block_size, ntime=ntime)
+    baltic = load_baltic_data("./GES_Baltic_5year_ALLE_Combined_4D.nc", block_size=block_size, ntime=ntime)
     master_3d = baltic["master_3d"]
-    var_to_idx = baltic["var_to_idx"]
-    spatial_blocks = baltic["spatial_blocks"]
-
-    fold_ids = assign_kfold_blocks(spatial_blocks, n_splits=n_splits, seed=123)
-    # 0-based target time indices: 6..13 (corresponding to pentads 7..14 in R)
-    target_times = list(range(sequence_length - 1, ntime))
+    var_idx = baltic["var_idx"]
+    fold_ids = assign_kfold_blocks(baltic["spatial_blocks"], n_splits=n_splits, seed=123)
 
     metrics_rows = []
     shap_rows = []
-    raw_shap_export = {
-        scen: {"shap_vals": [], "feature_data": []} for scen in VAR_COM.keys()
-    }
+    inertia_rows = []
+    raw_shap_export = {s: {"shap_vals": [], "feature_data": []} for s in VAR_COM}
     global_targets = []
     global_preds = []
+    target_times_0 = list(range(sequence_length - 1, ntime))  # 0-based indices 6..13 (1985..2020)
 
     for sim_name, vari in VAR_COM.items():
         nvari = len(vari)
         print("\n" + "=" * 50)
-        print(f"Starting {n_splits}-Fold Spatial CV ({model_name}) for: {sim_name}")
+        print(f"Starting 10-Fold Spatial CV ({model_name}) for: {sim_name}")
         print("=" * 50)
 
         for k in range(1, n_splits + 1):
             print(f"   Running Fold {k} / {n_splits}...")
+            gc.collect()
             if torch.cuda.is_available():
-                gc.collect()
                 torch.cuda.empty_cache()
 
             val_k = 1 if k == n_splits else k + 1
-            train_idx = np.flatnonzero((fold_ids != k) & (fold_ids != val_k))
-            val_idx = np.flatnonzero(fold_ids == val_k)
-            test_idx = np.flatnonzero(fold_ids == k)
+            train_idx = np.where((fold_ids != k) & (fold_ids != val_k))[0]
+            val_idx = np.where(fold_ids == val_k)[0]
+            test_idx = np.where(fold_ids == k)[0]
 
-            # Zero-Leakage Standardisation fit strictly on Training Fold
             fold_3d = master_3d.copy()
             for p in vari:
-                p_idx = var_to_idx[p]
-                mean_tr = float(np.nanmean(fold_3d[train_idx, :, p_idx]))
-                sd_tr = float(np.nanstd(fold_3d[train_idx, :, p_idx], ddof=1))
-                fold_3d[:, :, p_idx] = (fold_3d[:, :, p_idx] - mean_tr) / sd_tr
+                p_i = var_idx[p]
+                sub_tr = fold_3d[train_idx, :, p_i]
+                mean_tr = float(np.nanmean(sub_tr))
+                sd_tr = float(np.nanstd(sub_tr, ddof=1))
+                fold_3d[:, :, p_i] = (fold_3d[:, :, p_i] - mean_tr) / sd_tr
 
-            X_train, Y_train = create_sequences(
-                fold_3d, var_to_idx, train_idx, target_times, vari, target_var, sequence_length
-            )
-            X_val, Y_val = create_sequences(
-                fold_3d, var_to_idx, val_idx, target_times, vari, target_var, sequence_length
-            )
-            X_test, Y_test = create_sequences(
-                fold_3d, var_to_idx, test_idx, target_times, vari, target_var, sequence_length
-            )
+            X_tr, Y_tr = create_sequences_3d(fold_3d, var_idx, train_idx, target_times_0, vari, target_var, sequence_length)
+            X_va, Y_va = create_sequences_3d(fold_3d, var_idx, val_idx, target_times_0, vari, target_var, sequence_length)
+            X_te, Y_te = create_sequences_3d(fold_3d, var_idx, test_idx, target_times_0, vari, target_var, sequence_length)
             del fold_3d
 
-            set_seeds(123 + k)
-            model = LSTMNet(nvari, sequence_length=sequence_length)
-            model = train_neural_network(
-                model, X_train, Y_train, X_val, Y_val,
-                device=device, batch_size=batch_size, num_epochs=num_epochs,
-                patience=patience, learning_rate=learning_rate, fold_label=f"Fold {k}"
+            set_all_seeds(123 + k)
+            model = LSTMNet(nvari=nvari, seq_len=sequence_length)
+            model = train_model_vram(
+                model=model,
+                X_train=X_tr,
+                Y_train=Y_tr,
+                X_val=X_va,
+                Y_val=Y_va,
+                device=device,
+                batch_size=batch_size,
+                val_batch_size=pred_batch_size,
+                num_epochs=num_epochs,
+                patience=patience,
+                lr=learning_rate,
+                fold_label=f"Fold {k}",
             )
 
-            prob_preds = predict_batches(model, X_test, device=device)
-            eval_res = evaluate_predictions(Y_test, prob_preds, tt_threshold=tt_threshold)
+            prob_preds = predict_batches(model, X_te, device=device, batch_size=pred_batch_size)
+            ev = calc_eval_metrics(Y_te, prob_preds, threshold=tt_threshold)
 
             if sim_name == "Comprehensive":
-                global_targets.extend(eval_res["true_ges"].tolist())
-                global_preds.extend(eval_res["pred_ges"].tolist())
+                global_targets.append(ev["true_ges"])
+                global_preds.append(ev["pred_ges"])
 
             metrics_rows.append({
                 "Scenario":  sim_name,
-                "Split":     k,
-                "RMSE":      eval_res["RMSE"],
-                "R2":        eval_res["R2"],
-                "ACC":       eval_res["ACC"],
-                "Precision": eval_res["Precision"],
-                "Recall":    eval_res["Recall"],
-                "F1":        eval_res["F1"],
+                "Fold":      k,
+                "RMSE":      ev["RMSE"],
+                "R2":        ev["R2"],
+                "ACC":       ev["ACC"],
+                "Precision": ev["Precision"],
+                "Recall":    ev["Recall"],
+                "F1":        ev["F1"],
             })
 
-            # Monte Carlo SHAP on final sequence step (replicated across sequence_length in wrapper)
-            rng = np.random.default_rng(123 + k)
-            bg_idx = rng.choice(X_train.shape[0], size=min(500, X_train.shape[0]), replace=False)
-            te_idx = rng.choice(X_test.shape[0], size=min(2000, X_test.shape[0]), replace=False)
+            rng_sub = np.random.default_rng(123 + k)
+            bg_idx = rng_sub.choice(X_tr.shape[0], size=min(500, X_tr.shape[0]), replace=False)
+            te_idx = rng_sub.choice(X_te.shape[0], size=min(2000, X_te.shape[0]), replace=False)
+            X_bg_3d = X_tr[bg_idx]
+            X_test_3d = X_te[te_idx]
 
-            X_bg_2d = X_train[bg_idx, sequence_length - 1, :]
-            X_test_2d = X_test[te_idx, sequence_length - 1, :]
-
-            shap_vals, feat_df, global_imp = compute_fastshap_mc(
-                model, X_bg_2d, X_test_2d, vari,
-                device=device, nsim=50, is_lstm=True, sequence_length=sequence_length, seed=123 + k
+            shap_res = compute_3d_shap_lstm(
+                model=model,
+                X_bg_3d=X_bg_3d,
+                X_test_3d=X_test_3d,
+                feature_names=vari,
+                device=device,
+                nsim=nsim_shap,
+                seed=123 + k,
             )
 
-            raw_shap_export[sim_name]["shap_vals"].append(shap_vals)
-            raw_shap_export[sim_name]["feature_data"].append(feat_df)
+            raw_shap_export[sim_name]["shap_vals"].append(shap_res["shap_vals"])
+            raw_shap_export[sim_name]["feature_data"].append(shap_res["feature_data"])
 
-            for feat, imp_val in global_imp.items():
+            for feat in vari:
                 shap_rows.append({
                     "Scenario":      sim_name,
-                    "Split":         k,
+                    "Fold":          k,
                     "Feature":       feat,
-                    "SHAP_Mean_Abs": imp_val,
+                    "SHAP_Mean_Abs": shap_res["global_imp"][feat],
                 })
+
+            if sim_name == "Comprehensive":
+                iner_res = compute_temporal_block_shap(
+                    model=model,
+                    X_bg_3d=X_bg_3d,
+                    X_test_3d=X_test_3d,
+                    feature_names=vari,
+                    device=device,
+                    nsim=nsim_shap,
+                    seed=123 + k,
+                )
+                inertia_rows.append({"Fold": k, **iner_res})
 
     for scen in raw_shap_export:
         raw_shap_export[scen]["shap_vals"] = np.vstack(raw_shap_export[scen]["shap_vals"])
@@ -160,29 +178,49 @@ def main():
 
     metrics_collection = pd.DataFrame(metrics_rows)
     shap_collection = pd.DataFrame(shap_rows)
-    final_metrics, final_shap = aggregate_summary_tables(metrics_collection, shap_collection)
+    inertia_collection = pd.DataFrame(inertia_rows)
+    final_metrics = summarize_metrics_df(metrics_collection)
+    final_shap = summarize_shap_df(shap_collection)
 
-    print("\n--- FINAL SPATIAL METRICS (LSTM_SPAT) ---")
+    n_in = len(inertia_collection)
+    ci_m = 1.96 / np.sqrt(n_in)
+    inertia_summary = pd.DataFrame([{
+        "History_SHAP_Mean":    inertia_collection["History_SHAP"].mean(),
+        "Current_SHAP_Mean":    inertia_collection["Current_SHAP"].mean(),
+        "History_Pct_Mean":     inertia_collection["History_Share_Pct"].mean(),
+        "History_Pct_CI":       ci_m * inertia_collection["History_Share_Pct"].std(ddof=1),
+        "History_Dyn_Pct_Mean": inertia_collection["History_Dyn_Share_Pct"].mean(),
+        "History_Dyn_Pct_CI":   ci_m * inertia_collection["History_Dyn_Share_Pct"].std(ddof=1),
+    }])
+
+    print(f"\n--- FINAL SPATIAL METRICS ({model_name}) ---")
     print(final_metrics.to_string(index=False))
-    print("\n--- FINAL SHAP IMPORTANCE (LSTM_SPAT) ---")
+    print(f"\n--- FINAL SHAP IMPORTANCE ({model_name}) ---")
     print(final_shap.to_string(index=False))
+    print(f"\n--- TEMPORAL INERTIA DIAGNOSTIC ({model_name} Comprehensive: Steps 1-6 vs Step 7) ---")
+    print(inertia_summary.to_string(index=False))
 
-    summary_export_data = {
-        "metrics":     final_metrics,
-        "raw_metrics": metrics_collection,
-        "final_shap":  final_shap,
-        "raw_shap":    shap_collection,
+    summary_export = {
+        "metrics":          final_metrics,
+        "raw_metrics":      metrics_collection,
+        "final_shap":       final_shap,
+        "raw_shap":         shap_collection,
+        "temporal_inertia": {"summary": inertia_summary, "by_fold": inertia_collection},
     }
+    cf_eval = build_confusion_dict(
+        np.concatenate(global_targets), np.concatenate(global_preds)
+    )
 
-    summary_file = os.path.join(out_dir, f"Summary_{model_name}.pkl")
-    raw_shap_file = os.path.join(out_dir, f"SHAP_RAW_{model_name}.pkl")
-    cf_file = os.path.join(out_dir, f"CF_Matrix_{model_name}.pkl")
+    f_sum = os.path.join(out_dir, f"Summary_{model_name}.pkl")
+    f_shp = os.path.join(out_dir, f"SHAP_RAW_{model_name}.pkl")
+    f_cfm = os.path.join(out_dir, f"CF_Matrix_{model_name}.pkl")
 
-    save_pickle(summary_export_data, summary_file)
-    save_pickle(raw_shap_export, raw_shap_file)
-    save_pickle(build_confusion_matrix_df(global_targets, global_preds), cf_file)
+    save_pickle(summary_export, f_sum)
+    save_pickle(raw_shap_export, f_shp)
+    save_pickle(cf_eval, f_cfm)
 
-    print(f"\nAll outputs successfully saved for {model_name}:\n  - {summary_file}\n  - {raw_shap_file}\n  - {cf_file}")
+    print(f"\nAll outputs successfully saved for {model_name}:")
+    print(f"  - {f_sum}\n  - {f_shp}\n  - {f_cfm}")
 
 
 if __name__ == "__main__":

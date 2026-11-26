@@ -1,0 +1,19 @@
+Group,Scenario,Accuracy,F1_Score,RMSE,R2,Paired_p_RMSE
+MLP_SPAT_Common8,Comprehensive,0.900 (±0.009),0.844 (±0.020),0.060 (±0.004),0.792 (±0.025),-
+MLP_SPAT_Common8,MSFD_Baseline,0.888 (±0.005),0.828 (±0.015),0.070 (±0.006),0.721 (±0.030),-
+MLP_SPAT_Common8,Remote_Sensing,0.877 (±0.008),0.802 (±0.021),0.082 (±0.004),0.615 (±0.035),-
+MLP_SEQ7_Windowed,Comprehensive,0.918 (±0.006),0.875 (±0.012),0.048 (±0.003),0.867 (±0.009),-
+MLP_SEQ7_Windowed,MSFD_Baseline,0.914 (±0.008),0.870 (±0.014),0.053 (±0.003),0.843 (±0.011),-
+MLP_SEQ7_Windowed,Remote_Sensing,0.910 (±0.007),0.859 (±0.013),0.053 (±0.004),0.843 (±0.013),-
+LSTM_SPAT_Common8,Comprehensive,0.934 (±0.006),0.901 (±0.013),0.041 (±0.003),0.906 (±0.011),-
+LSTM_SPAT_Common8,MSFD_Baseline,0.929 (±0.007),0.895 (±0.012),0.043 (±0.002),0.895 (±0.008),-
+LSTM_SPAT_Common8,Remote_Sensing,0.931 (±0.006),0.897 (±0.012),0.043 (±0.002),0.897 (±0.009),-
+LSTM_SPAT minus MLP_SPAT (Common 1985-2020),Comprehensive,+0.034 (±0.005),+0.057 (±0.010),-0.020 (±0.003),+0.114 (±0.021),3.10e-07
+LSTM_SPAT minus MLP_SPAT (Common 1985-2020),MSFD_Baseline,+0.042 (±0.004),+0.067 (±0.009),-0.027 (±0.005),+0.174 (±0.027),1.03e-06
+LSTM_SPAT minus MLP_SPAT (Common 1985-2020),Remote_Sensing,+0.054 (±0.007),+0.095 (±0.014),-0.040 (±0.003),+0.282 (±0.031),6.46e-10
+MLP_SEQ7 minus MLP_SPAT (35-yr Window Effect),Comprehensive,+0.018 (±0.004),+0.030 (±0.010),-0.012 (±0.002),+0.075 (±0.019),5.92e-06
+MLP_SEQ7 minus MLP_SPAT (35-yr Window Effect),MSFD_Baseline,+0.027 (±0.005),+0.042 (±0.010),-0.018 (±0.004),+0.122 (±0.029),2.32e-05
+MLP_SEQ7 minus MLP_SPAT (35-yr Window Effect),Remote_Sensing,+0.033 (±0.007),+0.058 (±0.013),-0.029 (±0.003),+0.228 (±0.033),1.21e-08
+LSTM_SPAT minus MLP_SEQ7 (Pure Recurrence Effect),Comprehensive,+0.016 (±0.004),+0.027 (±0.005),-0.008 (±0.002),+0.039 (±0.007),5.19e-06
+LSTM_SPAT minus MLP_SEQ7 (Pure Recurrence Effect),MSFD_Baseline,+0.015 (±0.003),+0.026 (±0.004),-0.010 (±0.002),+0.052 (±0.010),4.97e-06
+LSTM_SPAT minus MLP_SEQ7 (Pure Recurrence Effect),Remote_Sensing,+0.021 (±0.005),+0.038 (±0.008),-0.010 (±0.002),+0.054 (±0.012),1.14e-05

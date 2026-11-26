@@ -1,27 +1,31 @@
 # ==============================================================================
 # Module: tti_common.py
-# Title: Shared Utilities for TTI Deep Learning Framework (Data, Models, SHAP)
+# Title: Shared PyTorch GPU Training, NetCDF I/O & 2D/3D Shapley Engine
+# Description: Core utilities for the TTI_ANN_Python reproducible workflow:
+#                - NetCDF4 reader aligned with R terra::sds orientation & blocks
+#                - 2D contemporaneous & 3D 7-pentad sequence builders
+#                - MLP (128-64) & stacked LSTM (128-64) PyTorch architectures
+#                - Full-VRAM GPU training loops (batch_size=2048 for Adam steps,
+#                  val_batch_size=65536 for single-pass validation/inference)
+#                - Pure-GPU 2D (MLP) & 3D trajectory-level (LSTM) Monte Carlo
+#                  Shapley estimators (Strumbelj & Kononenko, 2014) plus exact
+#                  2-block temporal inertia Shapley decomposition (Steps 1-6 vs 7)
 # Reference: Stips et al. (2026) - Environmental Modelling & Software
 # License: GPL-3.0
 # ==============================================================================
 
 import os
-import gc
 import copy
-import random
-import zipfile
 import pickle
+import zipfile
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-# Flexible NetCDF backend support (netCDF4, xarray, or h5py)
-try:
-    import netCDF4 as nc
-    HAS_NETCDF4 = True
-except ImportError:
-    nc = None
-    HAS_NETCDF4 = False
+
+# NetCDF readers (netCDF4 / xarray) are imported lazily inside load_baltic_data()
+# so post-processing scripts (06, 08, 09, 10) can import tti_common without NetCDF I/O.
+
 
 VAR_COM = {
     "MSFD_Baseline":  ["Nit", "Pho", "Chla", "DO2_mg", "Secchi"],
@@ -30,341 +34,298 @@ VAR_COM = {
 }
 
 
-def set_seeds(seed: int = 123):
-    """Set deterministic seeds across Python, NumPy, and PyTorch (CPU & CUDA)."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+def init_torch_device(num_threads: int = 4, seed: int = 123) -> torch.device:
+    """Restrict host OpenMP threads and initialize deterministic RNG seeds."""
+    torch.set_num_threads(int(num_threads))
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
-
-def get_device() -> torch.device:
-    """Return CUDA device if available, else CPU, clearing cache."""
-    if torch.cuda.is_available():
-        gc.collect()
-        torch.cuda.empty_cache()
+        torch.cuda.manual_seed_all(int(seed))
         return torch.device("cuda")
     return torch.device("cpu")
 
 
-def ensure_nc_file(nc_path: str = "./GES_Baltic_5year_ALLE_Combined_4D.nc") -> str:
-    """Locate or automatically unzip the input NetCDF dataset."""
-    if os.path.exists(nc_path):
-        return nc_path
-    zip_path = nc_path + ".zip"
-    if os.path.exists(zip_path):
+def set_all_seeds(seed: int) -> None:
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+
+
+def save_pickle(obj, path: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def load_pickle(path: str):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def ensure_netcdf_unzipped(
+    nc_path: str = "./GES_Baltic_5year_ALLE_Combined_4D.nc",
+    zip_path: str = "./GES_Baltic_5year_ALLE_Combined_4D.nc.zip",
+) -> str:
+    if not os.path.exists(nc_path) and os.path.exists(zip_path):
         print(f"Unzipping {zip_path} ...")
         with zipfile.ZipFile(zip_path, "r") as zf:
             zf.extractall(os.path.dirname(nc_path) or "./")
-        if os.path.exists(nc_path):
-            return nc_path
-    # Check parent directory as fallback
-    parent_nc = os.path.join("..", os.path.basename(nc_path))
-    if os.path.exists(parent_nc):
-        return parent_nc
-    parent_zip = parent_nc + ".zip"
-    if os.path.exists(parent_zip):
-        print(f"Unzipping {parent_zip} ...")
-        with zipfile.ZipFile(parent_zip, "r") as zf:
-            zf.extractall("./")
-        if os.path.exists(nc_path):
-            return nc_path
-    raise FileNotFoundError(
-        f"Could not find {nc_path} or {zip_path}. "
-        "Please place GES_Baltic_5year_ALLE_Combined_4D.nc (or .nc.zip) in the repository root."
-    )
+    if not os.path.exists(nc_path):
+        raise FileNotFoundError(f"NetCDF file not found: {nc_path}")
+    return nc_path
+
+
+def _extract_var_3d(raw_arr: np.ndarray, nlat: int, nlon: int, ntime: int, flip_lat: bool) -> np.ndarray:
+    """Standardize any NetCDF variable array to shape (ntime, nlat, nlon) with row 0 = North."""
+    arr = np.asarray(raw_arr, dtype=np.float64)
+    if np.ma.isMaskedArray(raw_arr):
+        arr = np.ma.filled(raw_arr.astype(np.float64), np.nan)
+    # Remove singleton dimensions (e.g., depth=1 in 4D NetCDF) except when ntime==1
+    while arr.ndim > 3:
+         squeezed = False
+         for ax in range(arr.ndim):
+             if arr.shape[ax] == 1 and arr.shape != (1, nlat, nlon):
+                 arr = np.squeeze(arr, axis=ax)
+                 squeezed = True
+                 break
+         if not squeezed:
+             break
+
+    if arr.ndim == 2 and arr.shape == (nlat, nlon):
+        arr = np.repeat(arr[np.newaxis, :, :], ntime, axis=0)
+    elif arr.ndim == 2 and arr.shape == (nlon, nlat):
+        arr = np.repeat(arr.T[np.newaxis, :, :], ntime, axis=0)
+    elif arr.ndim == 3:
+        # Identify axes matching ntime, nlat, nlon
+        shape = arr.shape
+        if shape[1] == nlat and shape[2] == nlon:
+            pass
+        elif shape[0] == nlat and shape[1] == nlon:
+            arr = np.moveaxis(arr, 2, 0)
+        elif shape[0] == nlon and shape[1] == nlat:
+            arr = np.transpose(arr, (2, 1, 0))
+        elif shape[2] == nlat and shape[1] == nlon:
+            arr = np.transpose(arr, (0, 2, 1))
+
+        if arr.shape[0] == 1 and ntime > 1:
+            arr = np.repeat(arr, ntime, axis=0)
+        else:
+            arr = arr[:ntime, :, :]
+    else:
+        raise ValueError(f"Unexpected variable shape {arr.shape} for grid ({nlat}, {nlon})")
+
+    if flip_lat:
+        arr = arr[:, ::-1, :]
+    return arr
 
 
 def load_baltic_data(
     nc_path: str = "./GES_Baltic_5year_ALLE_Combined_4D.nc",
     block_size: int = 10,
     ntime: int = 14,
-):
+) -> dict:
     """
-    Load the 4D GETM-ERGOM NetCDF file and orient the raster grid identically
-    to R's `terra::sds()` (Row 1 = North / max latitude, Col 1 = West / min longitude,
-    flattened row-wise).
+    Load the 4D Baltic Sea NetCDF dataset and align wet-pixel ordering and
+    10x10 (or 20x20) spatial blocks with R terra::sds (row 0 = North, row-major).
     """
-    nc_path = ensure_nc_file(nc_path)
-    if not HAS_NETCDF4:
-        try:
-            import xarray as xr
-            xds = xr.open_dataset(nc_path)
-            coord_keys = list(xds.coords.keys()) + list(xds.variables.keys())
-            lon_name = next((k for k in coord_keys if k.lower() in ("lon", "longitude", "x")), None)
-            lat_name = next((k for k in coord_keys if k.lower() in ("lat", "latitude", "y")), None)
-            lons = np.array(xds[lon_name].values, dtype=np.float64)
-            lats = np.array(xds[lat_name].values, dtype=np.float64)
-            flip_lat = lats[0] < lats[-1]
-            flip_lon = lons[0] > lons[-1]
-            if flip_lat:
-                lats = lats[::-1]
-            if flip_lon:
-                lons = lons[::-1]
-            nlat, nlon = len(lats), len(lons)
-            var_names = [v for v in xds.data_vars.keys() if xds[v].ndim >= 2]
-            def read_xr_3d(vname):
-                arr = np.array(xds[vname].values, dtype=np.float64)
-                arr[np.abs(arr) > 1e15] = np.nan
-                arr = np.squeeze(arr)
-                if arr.ndim == 2:
-                    arr = np.repeat(arr[np.newaxis, :, :], ntime, axis=0)
-                elif arr.ndim == 3:
-                    if arr.shape[0] != ntime:
-                        t_axis = next((i for i, s in enumerate(arr.shape) if s == ntime), 0)
-                        arr = np.moveaxis(arr, t_axis, 0)
-                    if arr.shape[1] == nlon and arr.shape[2] == nlat:
-                        arr = np.swapaxes(arr, 1, 2)
-                if flip_lat:
-                    arr = arr[:, ::-1, :]
-                if flip_lon:
-                    arr = arr[:, :, ::-1]
-                return arr
-            depth_slice0 = read_xr_3d("Depth")[0, :, :]
-            ii_good = np.flatnonzero(~np.isnan(depth_slice0.ravel(order="C")))
-            ngoodp = len(ii_good)
-            rows_0, cols_0 = np.unravel_index(ii_good, (nlat, nlon))
-            spatial_blocks = np.array(
-                [f"{int(np.ceil((r + 1) / block_size))}_{int(np.ceil((c + 1) / block_size))}" for r, c in zip(rows_0, cols_0)]
-            )
-            lon_lat_df = pd.DataFrame({"Longitude": lons[cols_0], "Latitude": lats[rows_0]})
-            master_3d = np.full((ngoodp, ntime, len(var_names)), np.nan, dtype=np.float64)
-            var_to_idx = {v: i for i, v in enumerate(var_names)}
-            for i, vname in enumerate(var_names):
-                flat_2d = read_xr_3d(vname).reshape(ntime, -1, order="C").T
-                master_3d[:, :, i] = flat_2d[ii_good, :]
-            xds.close()
-            if "Chla" in var_to_idx:
-                c_idx = var_to_idx["Chla"]
-                master_3d[:, :, c_idx] = np.log10(np.maximum(master_3d[:, :, c_idx] + 0.01, 1e-6))
-            return {
-                "master_3d": master_3d, "var_names": var_names, "var_to_idx": var_to_idx,
-                "ii_good": ii_good, "ngoodp": ngoodp, "ntime": ntime,
-                "spatial_blocks": spatial_blocks, "lon_lat_df": lon_lat_df,
-                "grid_shape": (nlat, nlon), "lats": lats, "lons": lons,
-                "rows_0": rows_0, "cols_0": cols_0,
-            }
-        except ImportError:
-            raise ImportError("Please install `netCDF4` or `xarray` (`pip install netCDF4 xarray`).")
-    ds = nc.Dataset(nc_path, mode="r")
+    nc_path = ensure_netcdf_unzipped(nc_path)
 
-    # Identify coordinate variables
-    coord_keys = list(ds.variables.keys())
-    lon_name = next((k for k in coord_keys if k.lower() in ("lon", "longitude", "x")), None)
-    lat_name = next((k for k in coord_keys if k.lower() in ("lat", "latitude", "y")), None)
-    if lon_name is None or lat_name is None:
-        raise ValueError(f"Could not identify lon/lat coordinates in {coord_keys}")
+    try:
+        import netCDF4 as nc
+        has_netcdf4 = True
+    except ImportError:
+        has_netcdf4 = False
+        import xarray as xr
 
-    lons = np.array(ds.variables[lon_name][:], dtype=np.float64)
-    lats = np.array(ds.variables[lat_name][:], dtype=np.float64)
+    raw_vars = {}
+    if has_netcdf4:
+        with nc.Dataset(nc_path, "r") as ds:
+            lat_key = next((k for k in ds.variables if k.lower() in ("lat", "latitude", "y")), None)
+            lon_key = next((k for k in ds.variables if k.lower() in ("lon", "longitude", "x")), None)
+            if lat_key is None or lon_key is None:
+                raise KeyError("Could not identify latitude/longitude coordinate variables in NetCDF.")
+            lats = np.asarray(ds.variables[lat_key][:], dtype=np.float64).ravel()
+            lons = np.asarray(ds.variables[lon_key][:], dtype=np.float64).ravel()
 
-    # In terra::sds(), row 0 is North (descending latitude) and col 0 is West (ascending longitude)
-    flip_lat = lats[0] < lats[-1]
-    flip_lon = lons[0] > lons[-1]
+            coord_keys = {lat_key, lon_key, "time", "lev", "depth_coord", "z", "bnds", "time_bnds"}
+            for k, v in ds.variables.items():
+                if k in coord_keys or v.ndim < 2:
+                    continue
+                arr = v[:]
+                fill_val = getattr(v, "_FillValue", None)
+                if np.ma.isMaskedArray(arr):
+                    arr = np.ma.filled(arr.astype(np.float64), np.nan)
+                else:
+                    arr = np.asarray(arr, dtype=np.float64)
+                if fill_val is not None and not np.isnan(fill_val):
+                    arr[np.isclose(arr, float(fill_val))] = np.nan
+                arr[arr < -1e10] = np.nan
+                arr[arr > 1e10] = np.nan
+                raw_vars[k] = arr
+    else:
+        ds = xr.open_dataset(nc_path)
+        lat_key = next((k for k in ds.coords if k.lower() in ("lat", "latitude", "y")), None)
+        lon_key = next((k for k in ds.coords if k.lower() in ("lon", "longitude", "x")), None)
+        lats = ds[lat_key].values.astype(np.float64).ravel()
+        lons = ds[lon_key].values.astype(np.float64).ravel()
+        for k in ds.data_vars:
+            arr = ds[k].values.astype(np.float64)
+            arr[np.abs(arr) > 1e10] = np.nan
+            raw_vars[k] = arr
+        ds.close()
+
+    nlat, nlon = len(lats), len(lons)
+    # Match R terra::sds top-to-bottom row indexing (row 0 = North)
+    flip_lat = bool(lats[0] < lats[-1])
     if flip_lat:
-        lats = lats[::-1]
-    if flip_lon:
-        lons = lons[::-1]
+        lats = lats[::-1].copy()
 
-    nlat = len(lats)
-    nlon = len(lons)
+    var_names = list(raw_vars.keys())
+    proc_vars = {
+        k: _extract_var_3d(raw_vars[k], nlat=nlat, nlon=nlon, ntime=ntime, flip_lat=flip_lat)
+        for k in var_names
+    }
 
-    # Identify data variables (exclude dimension coordinate variables)
-    dim_names = set(ds.dimensions.keys()) | {lon_name, lat_name, "time", "Time", "depth", "z", "lev"}
-    var_names = [v for v in ds.variables.keys() if v not in dim_names and len(ds.variables[v].shape) >= 2]
+    depth_2d = proc_vars["Depth"][0]
+    wet_mask = ~np.isnan(depth_2d)
+    rows_0, cols_0 = np.where(wet_mask)  # row-major (C-order) matches terra cell index order
+    ngoodp = len(rows_0)
 
-    def read_aligned_3d(vname):
-        var_obj = ds.variables[vname]
-        raw = var_obj[:]
-        if np.ma.isMaskedArray(raw):
-            arr = np.array(raw.filled(np.nan), dtype=np.float64)
-        else:
-            arr = np.array(raw, dtype=np.float64)
-        # Replace extreme fill values with NaN
-        fill_val = getattr(var_obj, "_FillValue", None)
-        missing_val = getattr(var_obj, "missing_value", None)
-        if fill_val is not None:
-            arr[np.isclose(arr, float(fill_val), equal_nan=True)] = np.nan
-        if missing_val is not None:
-            arr[np.isclose(arr, float(missing_val), equal_nan=True)] = np.nan
-        arr[np.abs(arr) > 1e15] = np.nan
+    # 1-based row/col block IDs matching R: ceiling(rc[,1] / block_size) _ ceiling(rc[,2] / block_size)
+    row_blk = ((rows_0 + 1 + block_size - 1) // block_size).astype(int)
+    col_blk = ((cols_0 + 1 + block_size - 1) // block_size).astype(int)
+    spatial_blocks = np.array([f"{r}_{c}" for r, c in zip(row_blk, col_blk)], dtype=object)
 
-        # Squeeze singleton dimensions (e.g., surface depth = 1 in 4D NetCDF)
-        arr = np.squeeze(arr)
-        if arr.ndim == 2:
-            # Broadcast static 2D layer across ntime
-            arr = np.repeat(arr[np.newaxis, :, :], ntime, axis=0)
-        elif arr.ndim == 3:
-            # Ensure shape is (ntime, nlat, nlon)
-            if arr.shape[0] != ntime:
-                t_axis = next((i for i, s in enumerate(arr.shape) if s == ntime), 0)
-                arr = np.moveaxis(arr, t_axis, 0)
-            if arr.shape[1] == nlon and arr.shape[2] == nlat:
-                arr = np.swapaxes(arr, 1, 2)
+    master_3d = np.empty((ngoodp, ntime, len(var_names)), dtype=np.float64)
+    for j, vname in enumerate(var_names):
+        # proc_vars[vname] is (ntime, nlat, nlon) -> transpose wet pixels to (ngoodp, ntime)
+        master_3d[:, :, j] = proc_vars[vname][:, rows_0, cols_0].T
 
-        if flip_lat:
-            arr = arr[:, ::-1, :]
-        if flip_lon:
-            arr = arr[:, :, ::-1]
-        return arr
-
-    depth_3d = read_aligned_3d("Depth")
-    depth_slice0 = depth_3d[0, :, :]  # (nlat, nlon)
-
-    # Flatten row-wise (C-order: West-to-East along each row from North to South, matching terra::values)
-    ii_good = np.flatnonzero(~np.isnan(depth_slice0.ravel(order="C")))
-    ngoodp = len(ii_good)
-
-    rows_0, cols_0 = np.unravel_index(ii_good, (nlat, nlon))
-    rows_1 = rows_0 + 1  # 1-based row index matching terra::rowColFromCell
-    cols_1 = cols_0 + 1  # 1-based col index matching terra::rowColFromCell
-
-    spatial_blocks = np.array(
-        [f"{int(np.ceil(r / block_size))}_{int(np.ceil(c / block_size))}" for r, c in zip(rows_1, cols_1)]
-    )
-
-    lon_lat_df = pd.DataFrame({
-        "Longitude": lons[cols_0],
-        "Latitude":  lats[rows_0],
-    })
-
-    num_vars = len(var_names)
-    master_3d = np.full((ngoodp, ntime, num_vars), np.nan, dtype=np.float64)
-    var_to_idx = {v: i for i, v in enumerate(var_names)}
-
-    for i, vname in enumerate(var_names):
-        arr_3d = read_aligned_3d(vname)  # (ntime, nlat, nlon)
-        # Flatten each time slice to (nlat*nlon) and index ii_good -> (ngoodp, ntime)
-        flat_2d = arr_3d.reshape(ntime, -1, order="C").T  # (nlat*nlon, ntime)
-        master_3d[:, :, i] = flat_2d[ii_good, :]
-
-    ds.close()
-
-    # Log-transform Chlorophyll-a identically to R scripts: log10(Chla + 0.01)
-    if "Chla" in var_to_idx:
-        c_idx = var_to_idx["Chla"]
-        master_3d[:, :, c_idx] = np.log10(np.maximum(master_3d[:, :, c_idx] + 0.01, 1e-6))
+    var_idx = {v: i for i, v in enumerate(var_names)}
+    if "Chla" in var_idx:
+        c_i = var_idx["Chla"]
+        master_3d[:, :, c_i] = np.log10(np.maximum(master_3d[:, :, c_i] + 0.01, 1e-6))
 
     return {
         "master_3d":      master_3d,
         "var_names":      var_names,
-        "var_to_idx":     var_to_idx,
-        "ii_good":        ii_good,
+        "var_idx":        var_idx,
         "ngoodp":         ngoodp,
-        "ntime":          ntime,
-        "spatial_blocks": spatial_blocks,
-        "lon_lat_df":     lon_lat_df,
         "grid_shape":     (nlat, nlon),
         "lats":           lats,
         "lons":           lons,
         "rows_0":         rows_0,
         "cols_0":         cols_0,
+        "cell_lats":      lats[rows_0],
+        "cell_lons":      lons[cols_0],
+        "spatial_blocks": spatial_blocks,
     }
 
 
 def assign_kfold_blocks(spatial_blocks: np.ndarray, n_splits: int = 10, seed: int = 123) -> np.ndarray:
-    """
-    Assign unique spatial blocks to `n_splits` non-overlapping folds (1..n_splits),
-    returning the Fold_ID (1..n_splits) for each marine wet pixel.
-    """
-    unique_blocks = list(dict.fromkeys(spatial_blocks))
+    """Assign unique spatial blocks to 1..n_splits folds deterministically."""
+    # Preserve first-appearance order of unique blocks (matching R's unique())
+    _, first_idx = np.unique(spatial_blocks, return_index=True)
+    unique_blocks = spatial_blocks[np.sort(first_idx)]
     n_blocks = len(unique_blocks)
-    rep_folds = np.resize(np.arange(1, n_splits + 1), n_blocks)
 
-    rng = np.random.default_rng(seed)
-    fold_assignments = rng.permutation(rep_folds)
+    rng = np.random.default_rng(int(seed))
+    base_folds = (np.arange(n_blocks) % n_splits) + 1
+    fold_assignments = rng.permutation(base_folds)
+
     block_to_fold = dict(zip(unique_blocks, fold_assignments))
-    return np.array([block_to_fold[b] for b in spatial_blocks], dtype=np.int32)
+    return np.array([block_to_fold[b] for b in spatial_blocks], dtype=np.int64)
 
 
-def assign_60_20_20_blocks(spatial_blocks: np.ndarray, seed: int = 123):
-    """
-    Partition unique spatial blocks into 60% Train, 20% Val, and 20% Test subsets
-    for the temporal rolling-origin hindcast scripts (03 and 04).
-    """
-    unique_blocks = np.array(list(dict.fromkeys(spatial_blocks)))
+def assign_train_val_test_blocks(spatial_blocks: np.ndarray, train_frac: float = 0.60, val_frac: float = 0.20, seed: int = 123):
+    """60% / 20% / 20% non-overlapping spatial block split for rolling-origin tasks."""
+    _, first_idx = np.unique(spatial_blocks, return_index=True)
+    unique_blocks = spatial_blocks[np.sort(first_idx)]
     n_blocks = len(unique_blocks)
-    train_size = int(np.floor(n_blocks * 0.60))
-    val_size = int(np.floor(n_blocks * 0.20))
 
-    rng = np.random.default_rng(seed)
+    train_size = int(np.floor(n_blocks * train_frac))
+    val_size = int(np.floor(n_blocks * val_frac))
+
+    rng = np.random.default_rng(int(seed))
     perm_blocks = rng.permutation(unique_blocks)
+
     train_blocks = set(perm_blocks[:train_size])
     val_blocks = set(perm_blocks[train_size : train_size + val_size])
     test_blocks = set(perm_blocks[train_size + val_size :])
 
-    train_idx = np.flatnonzero([b in train_blocks for b in spatial_blocks])
-    val_idx = np.flatnonzero([b in val_blocks for b in spatial_blocks])
-    test_idx = np.flatnonzero([b in test_blocks for b in spatial_blocks])
-    return train_idx, val_idx, test_idx, train_size, len(test_blocks)
+    train_idx = np.array([i for i, b in enumerate(spatial_blocks) if b in train_blocks], dtype=np.int64)
+    val_idx = np.array([i for i, b in enumerate(spatial_blocks) if b in val_blocks], dtype=np.int64)
+    test_idx = np.array([i for i, b in enumerate(spatial_blocks) if b in test_blocks], dtype=np.int64)
+    return train_idx, val_idx, test_idx, len(train_blocks), len(test_blocks)
 
 
 def flatten_2d(
-    master_3d: np.ndarray,
-    var_to_idx: dict,
+    data_3d: np.ndarray,
+    var_idx: dict,
     node_indices: np.ndarray,
     time_indices: np.ndarray,
     features: list,
     target_var: str = "TTI",
 ):
     """
-    Flatten 3D (node, time, var) slices into 2D matrices (samples, features)
-    in column-major time order (all nodes for t_1, then all nodes for t_2, ...),
-    matching R's `apply(extracted_data, 3, c)`.
+    Flatten (nodes, times, features) in time-major / cell-minor order matching R:
+    for each t in time_indices, rows are node_indices[0..N-1].
     """
-    feat_idx = [var_to_idx[f] for f in features]
-    targ_idx = var_to_idx[target_var]
+    feat_cols = [var_idx[f] for f in features]
+    targ_col = var_idx[target_var]
 
-    sub_x = master_3d[np.ix_(node_indices, time_indices, feat_idx)]  # (n_nodes, n_times, n_feat)
-    sub_y = master_3d[np.ix_(node_indices, time_indices, [targ_idx])][:, :, 0]  # (n_nodes, n_times)
+    # sub_x shape: (n_nodes, n_times, n_feat) -> transpose to (n_times, n_nodes, n_feat) -> reshape
+    sub_x = data_3d[np.ix_(node_indices, time_indices, feat_cols)]
+    n_nodes, n_times, n_feat = sub_x.shape
+    X_mat = np.transpose(sub_x, (1, 0, 2)).reshape(n_nodes * n_times, n_feat).astype(np.float32)
 
-    # Transpose (n_times, n_nodes, n_feat) then reshape so node varies fastest per time step
-    X = np.transpose(sub_x, (1, 0, 2)).reshape(-1, len(features))
-    Y = sub_y.T.reshape(-1)
-    return X.astype(np.float32), Y.astype(np.float32)
+    sub_y = data_3d[np.ix_(node_indices, time_indices, [targ_col])][:, :, 0]
+    Y_vec = sub_y.T.reshape(n_nodes * n_times).astype(np.float32)
+    return X_mat, Y_vec
 
 
-def create_sequences(
-    master_3d: np.ndarray,
-    var_to_idx: dict,
+def create_sequences_3d(
+    data_3d: np.ndarray,
+    var_idx: dict,
     node_indices: np.ndarray,
-    target_time_steps: list,
+    target_times_0: list,
     features: list,
     target_var: str = "TTI",
-    sequence_length: int = 7,
+    seq_len: int = 7,
 ):
     """
-    Construct 3D overlapping chronological sequences of shape
-    [samples, sequence_length = 7, features] for the LSTM architecture.
-    Note: `target_time_steps` uses 0-based time indices (0..13, so valid t >= sequence_length - 1).
+    Build 3D input tensors (N_samples, seq_len, n_features) and target vector (N_samples,).
+    target_times_0 uses 0-based time indices (e.g. range(6, 14) for pentads 7..14 = 1985..2020).
     """
-    feat_idx = [var_to_idx[f] for f in features]
-    targ_idx = var_to_idx[target_var]
+    feat_cols = [var_idx[f] for f in features]
+    targ_col = var_idx[target_var]
+    valid_t = [t for t in target_times_0 if t >= (seq_len - 1)]
 
     x_list, y_list = [], []
-    for t in target_time_steps:
-        if t < (sequence_length - 1):
-            continue
-        t_slice = list(range(t - sequence_length + 1, t + 1))
-        seq_x = master_3d[np.ix_(node_indices, t_slice, feat_idx)]  # (n_nodes, seq_len, n_feat)
-        seq_y = master_3d[node_indices, t, targ_idx]                # (n_nodes,)
-        x_list.append(seq_x)
-        y_list.append(seq_y)
+    for t_step in valid_t:
+        t_win = list(range(t_step - seq_len + 1, t_step + 1))
+        x_slice = data_3d[np.ix_(node_indices, t_win, feat_cols)]
+        y_slice = data_3d[node_indices, t_step, targ_col]
+        x_list.append(x_slice.astype(np.float32))
+        y_list.append(y_slice.astype(np.float32))
 
-    X = np.concatenate(x_list, axis=0).astype(np.float32)
-    Y = np.concatenate(y_list, axis=0).astype(np.float32)
-    return X, Y
+    X_out = np.concatenate(x_list, axis=0)
+    Y_out = np.concatenate(y_list, axis=0)
+    return X_out, Y_out
+
+
+def flatten_sequences_for_mlp_seq7(X_3d: np.ndarray) -> np.ndarray:
+    """Flatten (N, seq_len, n_feat) -> (N, seq_len * n_feat) for controlled MLP_SEQ7_Windowed."""
+    n_samples, seq_len, n_feat = X_3d.shape
+    return X_3d.reshape(n_samples, seq_len * n_feat).astype(np.float32)
 
 
 class MLPNet(nn.Module):
-    """Feedforward Multi-Layer Perceptron (128-64) with 0.2 Dropout."""
-
-    def __init__(self, nvari: int):
+    def __init__(self, in_features: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(nvari, 128),
+            nn.Linear(in_features, 128),
             nn.ReLU(),
             nn.Dropout(p=0.2),
             nn.Linear(128, 64),
@@ -378,11 +339,9 @@ class MLPNet(nn.Module):
 
 
 class LSTMNet(nn.Module):
-    """Stacked Recurrent LSTM Network (128-64, Sequence-to-One) with 0.2 Dropout."""
-
-    def __init__(self, nvari: int, sequence_length: int = 7):
+    def __init__(self, nvari: int, seq_len: int = 7):
         super().__init__()
-        self.sequence_length = sequence_length
+        self.seq_len = seq_len
         self.lstm1 = nn.LSTM(input_size=nvari, hidden_size=128, batch_first=True)
         self.drop1 = nn.Dropout(p=0.2)
         self.lstm2 = nn.LSTM(input_size=128, hidden_size=64, batch_first=True)
@@ -393,13 +352,11 @@ class LSTMNet(nn.Module):
         out1, _ = self.lstm1(x)
         out1 = self.drop1(out1)
         out2, _ = self.lstm2(out1)
-        # Explicitly extract final time step (sequence_length - 1) for Sequence-to-One mapping
-        last_step = out2[:, self.sequence_length - 1, :]
-        last_step = self.drop2(last_step)
+        last_step = self.drop2(out2[:, -1, :])
         return self.fc(last_step)
 
 
-def train_neural_network(
+def train_model_vram(
     model: nn.Module,
     X_train: np.ndarray,
     Y_train: np.ndarray,
@@ -407,244 +364,347 @@ def train_neural_network(
     Y_val: np.ndarray,
     device: torch.device,
     batch_size: int = 2048,
+    val_batch_size: int = 65536,
     num_epochs: int = 150,
     patience: int = 20,
-    learning_rate: float = 0.002,
-    fold_label: str = "",
+    lr: float = 0.002,
+    fold_label: str = None,
 ) -> nn.Module:
     """
-    Train MLP or LSTM model using Adam and MSE loss with dynamic early stopping
-    evaluated strictly on the isolated validation set.
+    Full-VRAM PyTorch trainer for both 2D MLP and 3D LSTM models.
+    Preserves batch_size=2048 for Adam updates while evaluating validation MSE
+    in fused 65,536-sample forward passes.
     """
     model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
 
-    x_tr = torch.tensor(X_train, dtype=torch.float32, device=device)
-    y_tr = torch.tensor(Y_train, dtype=torch.float32, device=device).view(-1, 1)
-    x_va = torch.tensor(X_val, dtype=torch.float32, device=device)
-    y_va = torch.tensor(Y_val, dtype=torch.float32, device=device).view(-1, 1)
+    x_tr = torch.as_tensor(X_train, dtype=torch.float32, device=device)
+    y_tr = torch.as_tensor(Y_train, dtype=torch.float32, device=device).unsqueeze(1)
+    x_va = torch.as_tensor(X_val, dtype=torch.float32, device=device)
+    y_va = torch.as_tensor(Y_val, dtype=torch.float32, device=device).unsqueeze(1)
 
     n_train = x_tr.shape[0]
     n_val = x_va.shape[0]
-    n_train_batches = (n_train - 1) // batch_size + 1
-    n_val_batches = (n_val - 1) // batch_size + 1
+    x_va_chunks = torch.split(x_va, val_batch_size, dim=0)
+    y_va_chunks = torch.split(y_va, val_batch_size, dim=0)
 
-    best_loss = float("inf")
+    best_val_loss = float("inf")
     best_state = None
     epochs_no_imp = 0
 
     for epoch in range(1, num_epochs + 1):
         model.train()
         perm = torch.randperm(n_train, device=device)
+        x_batches = torch.split(x_tr[perm], batch_size, dim=0)
+        y_batches = torch.split(y_tr[perm], batch_size, dim=0)
 
-        for b in range(n_train_batches):
-            start_i = b * batch_size
-            end_i = min((b + 1) * batch_size, n_train)
-            idx = perm[start_i:end_i]
-
-            optimizer.zero_grad()
-            preds = model(x_tr[idx])
-            loss = criterion(preds, y_tr[idx])
+        for xb, yb in zip(x_batches, y_batches):
+            optimizer.zero_grad(set_to_none=True)
+            preds = model(xb)
+            loss = criterion(preds, yb)
             loss.backward()
             optimizer.step()
 
         model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for b in range(n_val_batches):
-                start_i = b * batch_size
-                end_i = min((b + 1) * batch_size, n_val)
-                v_preds = model(x_va[start_i:end_i])
-                v_loss = criterion(v_preds, y_va[start_i:end_i])
-                val_loss += v_loss.item()
+        val_loss_sum = 0.0
+        with torch.inference_mode():
+            for xvb, yvb in zip(x_va_chunks, y_va_chunks):
+                v_preds = model(xvb)
+                v_loss = criterion(v_preds, yvb)
+                val_loss_sum += float(v_loss.item()) * xvb.shape[0]
 
-        avg_val_loss = val_loss / n_val_batches
-        if avg_val_loss < best_loss:
-            best_loss = avg_val_loss
+        avg_val_loss = val_loss_sum / n_val
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
             epochs_no_imp = 0
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         else:
             epochs_no_imp += 1
 
         if epochs_no_imp >= patience:
-            if fold_label:
+            if fold_label is not None:
                 print(f"      {fold_label} early stopped at epoch {epoch}.")
             break
 
     if best_state is not None:
-        model.load_state_dict(best_state)
-        model = model.to(device)
+        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
     model.eval()
     return model
 
 
-def predict_batches(model: nn.Module, X_data: np.ndarray, device: torch.device, batch_size: int = 4096) -> np.ndarray:
-    """Run batched forward pass on CPU/GPU and return 1D numpy predictions."""
+def predict_batches(
+    model: nn.Module,
+    X_arr: np.ndarray,
+    device: torch.device,
+    batch_size: int = 65536,
+) -> np.ndarray:
     model.eval()
-    n = X_data.shape[0]
-    preds_list = []
-    with torch.no_grad():
-        for start_i in range(0, n, batch_size):
-            end_i = min(start_i + batch_size, n)
-            batch_t = torch.tensor(X_data[start_i:end_i], dtype=torch.float32, device=device)
-            out = model(batch_t).detach().cpu().numpy().reshape(-1)
-            preds_list.append(out)
-    return np.concatenate(preds_list, axis=0)
+    n_samples = X_arr.shape[0]
+    preds_out = np.empty(n_samples, dtype=np.float64)
+    with torch.inference_mode():
+        for s_i in range(0, n_samples, batch_size):
+            e_i = min(s_i + batch_size, n_samples)
+            xb = torch.as_tensor(X_arr[s_i:e_i], dtype=torch.float32, device=device)
+            preds_out[s_i:e_i] = model(xb).squeeze(-1).cpu().numpy()
+    return preds_out
 
 
-def evaluate_predictions(true_tti: np.ndarray, prob_preds: np.ndarray, tt_threshold: float = 0.71) -> dict:
-    """Compute continuous (RMSE, R2) and binary GES classification metrics (ACC, Precision, Recall, F1)."""
-    pred_ges = (prob_preds > tt_threshold).astype(np.int32)
-    true_ges = (true_tti > tt_threshold).astype(np.int32)
+def calc_eval_metrics(true_tti: np.ndarray, prob_preds: np.ndarray, threshold: float = 0.71) -> dict:
+    true_tti = np.asarray(true_tti, dtype=np.float64)
+    prob_preds = np.asarray(prob_preds, dtype=np.float64)
+
+    pred_ges = (prob_preds > threshold).astype(np.int32)
+    true_ges = (true_tti > threshold).astype(np.int32)
 
     tp = int(np.sum((pred_ges == 1) & (true_ges == 1)))
     fp = int(np.sum((pred_ges == 1) & (true_ges == 0)))
     fn = int(np.sum((pred_ges == 0) & (true_ges == 1)))
     tn = int(np.sum((pred_ges == 0) & (true_ges == 0)))
 
-    total = tp + tn + fp + fn
-    acc = (tp + tn) / total if total > 0 else 0.0
+    acc = (tp + tn) / max(len(true_ges), 1)
     prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = (2.0 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+    f1 = (2.0 * prec * rec / (prec + rec)) if (prec + rec) > 0.0 else 0.0
 
-    mse_raw = float(np.mean((true_tti - prob_preds) ** 2))
-    rmse_val = float(np.sqrt(mse_raw))
+    rmse_val = float(np.sqrt(np.mean((true_tti - prob_preds) ** 2)))
     ss_res = float(np.sum((true_tti - prob_preds) ** 2))
     ss_tot = float(np.sum((true_tti - np.mean(true_tti)) ** 2))
-    r2_val = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+    r2_val = 1.0 - (ss_res / ss_tot) if ss_tot > 0.0 else np.nan
 
     return {
-        "RMSE":      rmse_val,
-        "R2":        r2_val,
-        "ACC":       acc,
+        "ACC": acc,
         "Precision": prec,
-        "Recall":    rec,
-        "F1":        f1,
-        "pred_ges":  pred_ges,
-        "true_ges":  true_ges,
+        "Recall": rec,
+        "F1": f1,
+        "RMSE": rmse_val,
+        "R2": r2_val,
+        "TP": tp,
+        "FP": fp,
+        "FN": fn,
+        "TN": tn,
+        "pred_ges": pred_ges,
+        "true_ges": true_ges,
     }
 
 
-def compute_fastshap_mc(
+def build_confusion_dict(true_ges_all: np.ndarray, pred_ges_all: np.ndarray) -> dict:
+    t = np.asarray(true_ges_all, dtype=np.int32)
+    p = np.asarray(pred_ges_all, dtype=np.int32)
+    return {
+        "TP": int(np.sum((p == 1) & (t == 1))),
+        "FP": int(np.sum((p == 1) & (t == 0))),
+        "FN": int(np.sum((p == 0) & (t == 1))),
+        "TN": int(np.sum((p == 0) & (t == 0))),
+        "Total": int(len(t)),
+    }
+
+
+def compute_2d_shap_mlp(
     model: nn.Module,
     X_bg_2d: np.ndarray,
     X_test_2d: np.ndarray,
     feature_names: list,
     device: torch.device,
     nsim: int = 50,
-    is_lstm: bool = False,
-    sequence_length: int = 7,
     seed: int = 123,
-):
+) -> dict:
     """
-    GPU-accelerated Monte Carlo Shapley Value estimator (Strumbelj & Kononenko, 2014),
-    mathematically identical to R's `fastshap::explain(..., nsim = 50)`.
-    For LSTM models, replicates the 2D feature perturbation across `sequence_length`
-    steps identically to the R `predict_fun` wrapper.
+    Pure-GPU 2D Monte Carlo Shapley Estimator for MLP (Strumbelj & Kononenko, 2014).
     """
-    rng = np.random.default_rng(seed)
-    n_test, n_feat = X_test_2d.shape
+    model.eval()
+    rng = np.random.default_rng(int(seed))
+    n_sub, nvari = X_test_2d.shape
     n_bg = X_bg_2d.shape[0]
 
-    shap_accum = np.zeros((n_test, n_feat), dtype=np.float64)
+    x_bg_t = torch.as_tensor(X_bg_2d, dtype=torch.float32, device=device)
+    x_te_t = torch.as_tensor(X_test_2d, dtype=torch.float32, device=device)
+    shap_accum = torch.zeros((n_sub, nvari), dtype=torch.float64, device=device)
+    row_arange = torch.arange(n_sub, device=device)
 
-    def eval_2d(mat_2d: np.ndarray) -> np.ndarray:
-        if is_lstm:
-            # Replicate 2D [N, n_feat] across sequence_length -> [N, seq_len, n_feat]
-            mat_3d = np.repeat(mat_2d[:, np.newaxis, :], sequence_length, axis=1)
-            return predict_batches(model, mat_3d, device=device, batch_size=4096)
-        return predict_batches(model, mat_2d, device=device, batch_size=4096)
+    with torch.inference_mode():
+        for _ in range(nsim):
+            bg_idx = torch.as_tensor(rng.integers(0, n_bg, size=n_sub), dtype=torch.long, device=device)
+            x_curr = x_bg_t[bg_idx].clone()
 
-    for _ in range(nsim):
-        bg_indices = rng.integers(0, n_bg, size=n_test)
-        X_bg_sample = X_bg_2d[bg_indices]  # (n_test, n_feat)
+            perms_np = np.argsort(rng.random((n_sub, nvari)), axis=1)
+            perms = torch.as_tensor(perms_np, dtype=torch.long, device=device)
 
-        # Generate random feature orderings per test sample
-        perms = np.argsort(rng.random((n_test, n_feat)), axis=1)
+            prev_preds = model(x_curr).squeeze(-1).to(torch.float64)
+            for s_step in range(nvari):
+                feat_col = perms[:, s_step]
+                x_curr[row_arange, feat_col] = x_te_t[row_arange, feat_col]
+                new_preds = model(x_curr).squeeze(-1).to(torch.float64)
+                diff = new_preds - prev_preds
+                shap_accum[row_arange, feat_col] += diff
+                prev_preds = new_preds
 
-        # Walk along the permutation chain from all-background to all-test
-        X_curr = X_bg_sample.copy()
-        prev_preds = eval_2d(X_curr)
-
-        for step in range(n_feat):
-            feat_col = perms[:, step]
-            row_idx = np.arange(n_test)
-            X_curr[row_idx, feat_col] = X_test_2d[row_idx, feat_col]
-            new_preds = eval_2d(X_curr)
-            diff = new_preds - prev_preds
-            shap_accum[row_idx, feat_col] += diff
-            prev_preds = new_preds
-
-    shap_vals = (shap_accum / float(nsim)).astype(np.float64)
-    feature_df = pd.DataFrame(X_test_2d, columns=feature_names)
-    global_imp = {feat: float(np.mean(np.abs(shap_vals[:, i]))) for i, feat in enumerate(feature_names)}
-    return shap_vals, feature_df, global_imp
+    shap_vals = (shap_accum / float(nsim)).cpu().numpy()
+    feat_df = pd.DataFrame(X_test_2d, columns=feature_names)
+    global_imp = {f: float(np.mean(np.abs(shap_vals[:, j]))) for j, f in enumerate(feature_names)}
+    return {"shap_vals": shap_vals, "feature_data": feat_df, "global_imp": global_imp}
 
 
-def aggregate_summary_tables(metrics_df: pd.DataFrame, shap_df: pd.DataFrame):
-    """Aggregate fold/origin metrics and SHAP values into Mean and 95% CI summaries."""
-    def ci95(series):
-        n = series.count()
-        if n <= 1:
-            return 0.0
-        return float(1.96 * series.std(ddof=1) / np.sqrt(n))
+def compute_3d_shap_lstm(
+    model: nn.Module,
+    X_bg_3d: np.ndarray,
+    X_test_3d: np.ndarray,
+    feature_names: list,
+    device: torch.device,
+    nsim: int = 50,
+    seed: int = 123,
+) -> dict:
+    """
+    Pure-GPU 3D Trajectory-Level Monte Carlo Shapley Estimator for LSTM
+    (Strumbelj & Kononenko, 2014; Reviewer 1, Revision 1, Comment 3).
+    Swaps complete 7-pentad predictor trajectories X[i, 0:7, f] rather than flatlines.
+    """
+    model.eval()
+    rng = np.random.default_rng(int(seed))
+    n_sub, seq_len, nvari = X_test_3d.shape
+    n_bg = X_bg_3d.shape[0]
 
-    grouped_m = []
-    for scen, grp in metrics_df.groupby("Scenario", sort=False):
-        grouped_m.append({
-            "Scenario":  scen,
-            "RMSE_Mean": float(grp["RMSE"].mean()),
-            "RMSE_CI":   ci95(grp["RMSE"]),
-            "R2_Mean":   float(grp["R2"].mean()),
-            "R2_CI":     ci95(grp["R2"]),
-            "ACC_Mean":  float(grp["ACC"].mean()),
-            "ACC_CI":    ci95(grp["ACC"]),
-            "Prec_Mean": float(grp["Precision"].mean()),
-            "Prec_CI":   ci95(grp["Precision"]),
-            "Rec_Mean":  float(grp["Recall"].mean()),
-            "Rec_CI":    ci95(grp["Recall"]),
-            "F1_Mean":   float(grp["F1"].mean()),
-            "F1_CI":     ci95(grp["F1"]),
-            "N_Splits":  int(len(grp)),
-        })
-    final_metrics = pd.DataFrame(grouped_m)
+    x_bg_t = torch.as_tensor(X_bg_3d, dtype=torch.float32, device=device)
+    x_te_t = torch.as_tensor(X_test_3d, dtype=torch.float32, device=device)
+    shap_accum = torch.zeros((n_sub, nvari), dtype=torch.float64, device=device)
+    row_arange = torch.arange(n_sub, device=device)
 
-    grouped_s = []
-    for (scen, feat), grp in shap_df.groupby(["Scenario", "Feature"], sort=False):
-        grouped_s.append({
-            "Scenario":  scen,
-            "Feature":   feat,
-            "SHAP_Mean": float(grp["SHAP_Mean_Abs"].mean()),
-            "SHAP_CI":   ci95(grp["SHAP_Mean_Abs"]),
-        })
-    final_shap = (
-        pd.DataFrame(grouped_s)
-        .sort_values(["Scenario", "SHAP_Mean"], ascending=[True, False])
-        .reset_index(drop=True)
-    )
-    return final_metrics, final_shap
+    with torch.inference_mode():
+        for _ in range(nsim):
+            bg_idx = torch.as_tensor(rng.integers(0, n_bg, size=n_sub), dtype=torch.long, device=device)
+            x_curr = x_bg_t[bg_idx].clone()
+
+            perms_np = np.argsort(rng.random((n_sub, nvari)), axis=1)
+            perms = torch.as_tensor(perms_np, dtype=torch.long, device=device)
+
+            prev_preds = model(x_curr).squeeze(-1).to(torch.float64)
+            for s_step in range(nvari):
+                feat_col = perms[:, s_step]
+                for f in range(nvari):
+                    mask = feat_col == f
+                    if torch.any(mask):
+                        x_curr[mask, :, f] = x_te_t[mask, :, f]
+                new_preds = model(x_curr).squeeze(-1).to(torch.float64)
+                diff = new_preds - prev_preds
+                shap_accum[row_arange, feat_col] += diff
+                prev_preds = new_preds
+
+    shap_vals = (shap_accum / float(nsim)).cpu().numpy()
+    feat_df = pd.DataFrame(X_test_3d[:, seq_len - 1, :], columns=feature_names)
+    global_imp = {f: float(np.mean(np.abs(shap_vals[:, j]))) for j, f in enumerate(feature_names)}
+    return {"shap_vals": shap_vals, "feature_data": feat_df, "global_imp": global_imp}
 
 
-def build_confusion_matrix_df(global_targets: list, global_preds: list) -> pd.DataFrame:
-    """Build a 2x2 confusion matrix table compatible with cvms / Script 10."""
-    t_arr = np.array(global_targets, dtype=np.int32)
-    p_arr = np.array(global_preds, dtype=np.int32)
+def compute_temporal_block_shap(
+    model: nn.Module,
+    X_bg_3d: np.ndarray,
+    X_test_3d: np.ndarray,
+    feature_names: list,
+    device: torch.device,
+    nsim: int = 50,
+    seed: int = 123,
+) -> dict:
+    """
+    Exact 2-Player Temporal Block Shapley Decomposition:
+    Antecedent History (Steps 1..6; 30 yr) vs Contemporaneous Target Pentad (Step 7; 5 yr).
+    """
+    model.eval()
+    rng = np.random.default_rng(int(seed))
+    n_sub, seq_len, nvari = X_test_3d.shape
+    n_bg = X_bg_3d.shape[0]
+    dyn_cols = [j for j, f in enumerate(feature_names) if f != "Depth"]
+    depth_cols = [j for j, f in enumerate(feature_names) if f == "Depth"]
+
+    x_bg_t = torch.as_tensor(X_bg_3d, dtype=torch.float32, device=device)
+    x_te_t = torch.as_tensor(X_test_3d, dtype=torch.float32, device=device)
+
+    phi_hist_all = torch.zeros(n_sub, dtype=torch.float64, device=device)
+    phi_curr_all = torch.zeros(n_sub, dtype=torch.float64, device=device)
+    phi_hist_dyn = torch.zeros(n_sub, dtype=torch.float64, device=device)
+    phi_curr_dyn = torch.zeros(n_sub, dtype=torch.float64, device=device)
+
+    with torch.inference_mode():
+        v_11 = model(x_te_t).squeeze(-1).to(torch.float64)
+        for _ in range(nsim):
+            bg_idx = torch.as_tensor(rng.integers(0, n_bg, size=n_sub), dtype=torch.long, device=device)
+            x_00 = x_bg_t[bg_idx]
+
+            # A. Full sequence (Steps 0..5 vs Step 6)
+            x_10 = x_00.clone()
+            x_10[:, : seq_len - 1, :] = x_te_t[:, : seq_len - 1, :]
+            x_01 = x_00.clone()
+            x_01[:, seq_len - 1, :] = x_te_t[:, seq_len - 1, :]
+
+            v_00 = model(x_00).squeeze(-1).to(torch.float64)
+            v_10 = model(x_10).squeeze(-1).to(torch.float64)
+            v_01 = model(x_01).squeeze(-1).to(torch.float64)
+
+            phi_hist_all += 0.5 * ((v_10 - v_00) + (v_11 - v_01))
+            phi_curr_all += 0.5 * ((v_01 - v_00) + (v_11 - v_10))
+
+            # B. Dynamic predictors only (holding static Depth fixed at test cell)
+            x_d00 = x_00.clone()
+            for dc in depth_cols:
+                x_d00[:, :, dc] = x_te_t[:, :, dc]
+            x_d10 = x_d00.clone()
+            x_d10[:, : seq_len - 1, dyn_cols] = x_te_t[:, : seq_len - 1, dyn_cols]
+            x_d01 = x_d00.clone()
+            x_d01[:, seq_len - 1, dyn_cols] = x_te_t[:, seq_len - 1, dyn_cols]
+
+            vd_00 = model(x_d00).squeeze(-1).to(torch.float64)
+            vd_10 = model(x_d10).squeeze(-1).to(torch.float64)
+            vd_01 = model(x_d01).squeeze(-1).to(torch.float64)
+
+            phi_hist_dyn += 0.5 * ((vd_10 - vd_00) + (v_11 - vd_01))
+            phi_curr_dyn += 0.5 * ((vd_01 - vd_00) + (v_11 - vd_10))
+
+    h_all = float(torch.mean(torch.abs(phi_hist_all / float(nsim))).item())
+    c_all = float(torch.mean(torch.abs(phi_curr_all / float(nsim))).item())
+    h_dyn = float(torch.mean(torch.abs(phi_hist_dyn / float(nsim))).item())
+    c_dyn = float(torch.mean(torch.abs(phi_curr_dyn / float(nsim))).item())
+
+    return {
+        "History_SHAP":          h_all,
+        "Current_SHAP":          c_all,
+        "History_Share_Pct":     100.0 * h_all / (h_all + c_all),
+        "History_Dyn_Share_Pct": 100.0 * h_dyn / (h_dyn + c_dyn),
+    }
+
+
+def summarize_metrics_df(metrics_df: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for p_val in [1, 0]:
-        for t_val in [1, 0]:
-            count = int(np.sum((p_arr == p_val) & (t_arr == t_val)))
-            rows.append({"Prediction": p_val, "Target": t_val, "N": count})
+    for scen, grp in metrics_df.groupby("Scenario", sort=False):
+        n = len(grp)
+        ci_mult = 1.96 / np.sqrt(n) if n > 1 else 0.0
+        rows.append({
+            "Scenario":  scen,
+            "RMSE_Mean": grp["RMSE"].mean(),
+            "RMSE_CI":   ci_mult * grp["RMSE"].std(ddof=1),
+            "R2_Mean":   grp["R2"].mean(),
+            "R2_CI":     ci_mult * grp["R2"].std(ddof=1),
+            "ACC_Mean":  grp["ACC"].mean(),
+            "ACC_CI":    ci_mult * grp["ACC"].std(ddof=1),
+            "Prec_Mean": grp["Precision"].mean(),
+            "Prec_CI":   ci_mult * grp["Precision"].std(ddof=1),
+            "Rec_Mean":  grp["Recall"].mean(),
+            "Rec_CI":    ci_mult * grp["Recall"].std(ddof=1),
+            "F1_Mean":   grp["F1"].mean(),
+            "F1_CI":     ci_mult * grp["F1"].std(ddof=1),
+            "N_Splits":  int(n),
+        })
     return pd.DataFrame(rows)
 
 
-def save_pickle(obj, path: str):
-    os.makedirs(os.path.dirname(path) or "./", exist_ok=True)
-    with open(path, "wb") as f:
-        pickle.dump(obj, f)
-
-
-def load_pickle(path: str):
-    with open(path, "rb") as f:
-        return pickle.load(f)
+def summarize_shap_df(shap_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for (scen, feat), grp in shap_df.groupby(["Scenario", "Feature"], sort=False):
+        n = len(grp)
+        ci_mult = 1.96 / np.sqrt(n) if n > 1 else 0.0
+        rows.append({
+            "Scenario":  scen,
+            "Feature":   feat,
+            "SHAP_Mean": grp["SHAP_Mean_Abs"].mean(),
+            "SHAP_CI":   ci_mult * grp["SHAP_Mean_Abs"].std(ddof=1),
+        })
+    out = pd.DataFrame(rows)
+    return out.sort_values(["Scenario", "SHAP_Mean"], ascending=[True, False]).reset_index(drop=True)
