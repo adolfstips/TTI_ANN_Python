@@ -22,6 +22,8 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import os
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 # NetCDF readers (netCDF4 / xarray) are imported lazily inside load_baltic_data()
 # so post-processing scripts (06, 08, 09, 10) can import tti_common without NetCDF I/O.
@@ -43,6 +45,10 @@ def init_torch_device(num_threads: int = 4, seed: int = 123) -> torch.device:
         torch.cuda.manual_seed_all(int(seed))
         return torch.device("cuda")
     return torch.device("cpu")
+    # Inside init_torch_device():
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True)
 
 
 def set_all_seeds(seed: int) -> None:
